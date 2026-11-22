@@ -2878,6 +2878,7 @@ fn setting_title(key: &str) -> &'static str {
         "usage_ttl_s" => "Usage reading lasts",
         "api_fallback" => "Use API keys at the limit",
         "notify" => "Notifications",
+        "keep_awake" => "Stay awake to summarise",
         "share" => "Shared with sessions",
         _ => "Setting",
     }

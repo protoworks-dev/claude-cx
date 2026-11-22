@@ -13,6 +13,12 @@
 //! at full price; cx says so, with the size, so the user can decide to
 //! clear or summarise next time.
 //!
+//! With the `keep_awake` setting on, the end of a turn on a large
+//! conversation also holds the Mac awake for a while. Claude Code
+//! summarises a conversation left idle just before its cache expires, but
+//! only if the machine is still awake then; a Mac that sleeps first pays
+//! for the whole conversation again on the next prompt.
+//!
 //! A hook must never break the session it runs in, so every failure here is
 //! swallowed and the command always succeeds.
 
@@ -225,6 +231,112 @@ pub fn handle(store_root: &Path, input: &Value, now_ms: i64, with_key: bool) -> 
     reply
 }
 
+/// What to do about keeping the machine awake when an event arrives.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Awake {
+    /// A turn ended on a conversation large enough to be summarised while
+    /// idle: hold the machine awake until that has had time to happen.
+    Hold,
+    /// The user is back, or the session ended: let it sleep again.
+    Release,
+    /// Nothing to change.
+    Leave,
+}
+
+/// How long to hold the machine awake after a turn, in seconds. Claude
+/// Code summarises an idle conversation about an hour after its last
+/// request; this leaves it twenty minutes to finish.
+const AWAKE_S: u32 = 80 * 60;
+
+/// The size from which Claude Code summarises an idle conversation: its
+/// own setting, which is never below 100,000.
+pub fn idle_summary_tokens() -> u64 {
+    std::env::var("CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .map_or(200_000, |n| n.max(100_000))
+}
+
+/// Decide from an event and the conversation's size (`None` when it could
+/// not be read) whether to hold the machine awake.
+pub fn awake_for(event: &str, tokens: Option<u64>, threshold: u64) -> Awake {
+    match event {
+        "Stop" if tokens.is_some_and(|t| t >= threshold) => Awake::Hold,
+        // A turn ended on a small conversation: an older hold has no use.
+        "Stop" | "UserPromptSubmit" | "SessionEnd" => Awake::Release,
+        _ => Awake::Leave,
+    }
+}
+
+/// End the `caffeinate` cx started for a session, if it is still running.
+#[cfg(target_os = "macos")]
+fn release(marker: &Path) {
+    let Ok(text) = std::fs::read_to_string(marker) else {
+        return;
+    };
+    let _ = std::fs::remove_file(marker);
+    let Ok(pid) = text.trim().parse::<i32>() else {
+        return;
+    };
+    // The number may have been given to another program since: only a
+    // caffeinate is ever signalled.
+    let ours = std::process::Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("caffeinate"));
+    if ours && pid > 1 {
+        // SAFETY: kill takes a pid and a signal and touches no memory.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+}
+
+/// Apply [`awake_for`] for one session: start or stop a `caffeinate` that
+/// prevents idle sleep. It ends by itself after [`AWAKE_S`].
+#[cfg(target_os = "macos")]
+fn keep_awake(store_root: &Path, input: &Value) {
+    let session = text(input, "session_id");
+    if !crate::store::plain_name(&session) {
+        return;
+    }
+    let tokens = input
+        .get("transcript_path")
+        .and_then(Value::as_str)
+        .and_then(|path| last_reply(Path::new(path)))
+        .map(|(_, tokens)| tokens);
+    let action = awake_for(&text(input, "hook_event_name"), tokens, idle_summary_tokens());
+    if action == Awake::Leave {
+        return;
+    }
+    let dir = store_root.join("awake");
+    let marker = dir.join(&session);
+    release(&marker);
+    if action == Awake::Hold
+        && util::mkdir_private(&dir).is_ok()
+        && let Ok(child) = std::process::Command::new("/usr/bin/caffeinate")
+            .args(["-i", "-t", &AWAKE_S.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    {
+        let _ = std::fs::write(&marker, child.id().to_string());
+    }
+}
+
+/// Whether the `keep_awake` setting is on, read straight from the state
+/// file so a hook does not open the whole engine.
+#[cfg(target_os = "macos")]
+fn keep_awake_is_on(store_root: &Path) -> bool {
+    util::read_json(&store_root.join("state.json"))
+        .ok()
+        .flatten()
+        .and_then(|state| state.get("settings")?.get("keep_awake")?.as_bool())
+        .unwrap_or(false)
+}
+
 /// Read a hook's input from standard input, record it, and print the
 /// reply. Never fails: a hook that errors would disturb the session.
 pub fn run(store_root: &Path) {
@@ -238,6 +350,10 @@ pub fn run(store_root: &Path) {
     let with_key = std::env::var_os("ANTHROPIC_API_KEY").is_some_and(|k| !k.is_empty());
     if let Some(reply) = handle(store_root, &input, util::now_ms(), with_key) {
         println!("{reply}");
+    }
+    #[cfg(target_os = "macos")]
+    if keep_awake_is_on(store_root) {
+        keep_awake(store_root, &input);
     }
 }
 
@@ -384,6 +500,16 @@ mod tests {
         // A small conversation is not worth a notice.
         std::fs::write(&transcript, reply(90, 20_000)).unwrap();
         assert_eq!(handle(&root, &prompt, now, false), None);
+    }
+
+    #[test]
+    fn the_machine_is_held_awake_only_after_a_turn_on_a_large_conversation() {
+        assert_eq!(awake_for("Stop", Some(250_000), 200_000), Awake::Hold);
+        assert_eq!(awake_for("Stop", Some(50_000), 200_000), Awake::Release);
+        assert_eq!(awake_for("Stop", None, 200_000), Awake::Release);
+        assert_eq!(awake_for("UserPromptSubmit", Some(250_000), 200_000), Awake::Release);
+        assert_eq!(awake_for("SessionEnd", None, 200_000), Awake::Release);
+        assert_eq!(awake_for("PreCompact", Some(250_000), 200_000), Awake::Leave);
     }
 
     #[test]

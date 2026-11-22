@@ -158,6 +158,7 @@ Environment: `CX_HOME` moves the state directory, `CX_SECRETS=file` forces file 
 | `usage_ttl_s` | 120 | Seconds a usage reading stays fresh for the active account (three times that for the others) |
 | `api_fallback` | false | Let a bare `cx run` use an API key when every subscription is at its limit |
 | `notify` | true | Desktop notifications from automatic switching |
+| `keep_awake` | false | With the plugin: keep the Mac awake for 80 minutes after a turn on a large conversation, so Claude Code summarises it before its cache expires |
 | `share` | settings, skills, plugins, hooks, history… | Entries of `~/.claude` a profile shares by symlink |
 
 ## Development

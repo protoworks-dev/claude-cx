@@ -288,6 +288,11 @@ pub struct Settings {
     /// Show a desktop notification when `cx auto` switches, when an account
     /// needs a new sign-in and when every account is at its limit.
     pub notify: bool,
+    /// Keep the Mac awake for a while after a turn ends on a large
+    /// conversation, so Claude Code can summarise it before its cache
+    /// expires. Needs the cx plugin's hooks. Off by default: it uses power.
+    #[serde(default)]
+    pub keep_awake: bool,
     /// Entries of `~/.claude` that a `cx run` profile shares by symlink.
     pub share: Vec<String>,
 }
@@ -305,6 +310,7 @@ impl Default for Settings {
             model: Some("auto".into()),
             api_fallback: false,
             notify: true,
+            keep_awake: false,
             share: [
                 "settings.json",
                 "keybindings.json",
@@ -330,7 +336,7 @@ impl Default for Settings {
 }
 
 /// Every setting with a line on what it does, in the order they are shown.
-pub const SETTING_HELP: [(&str, &str); 11] = [
+pub const SETTING_HELP: [(&str, &str); 12] = [
     (
         "strategy",
         "How a bare `cx run` and `cx use` choose: balanced, headroom or drain-soonest",
@@ -359,6 +365,10 @@ pub const SETTING_HELP: [(&str, &str); 11] = [
         "Let a bare `cx run` use an API key when every subscription is at its limit",
     ),
     ("notify", "Desktop notifications from `cx auto`"),
+    (
+        "keep_awake",
+        "Keep the Mac awake after a turn on a large conversation, so it is summarised before its cache expires",
+    ),
     (
         "share",
         "Entries of ~/.claude that a `cx run` profile shares by symlink",
