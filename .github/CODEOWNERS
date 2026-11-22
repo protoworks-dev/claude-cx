@@ -1,0 +1,14 @@
+# Every change needs a review from the owning team.
+*                   @protoworks-dev/devops
+
+# Credential handling: read the header of src/engine.rs before reviewing.
+/src/engine.rs      @protoworks-dev/devops
+/src/secrets.rs     @protoworks-dev/devops
+/src/cred.rs        @protoworks-dev/devops
+/src/claude.rs      @protoworks-dev/devops
+/src/transfer.rs    @protoworks-dev/devops
+
+# Release and supply chain.
+/Cargo.toml         @protoworks-dev/devops
+/Cargo.lock         @protoworks-dev/devops
+/.github/           @protoworks-dev/devops

@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/protoworks-dev/claude-cx/security/advisories/new
+    about: Private report. Please do not open a public issue.

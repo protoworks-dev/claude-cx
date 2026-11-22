@@ -1,0 +1,9 @@
+claude-cx
+Copyright 2026 Protoworks
+
+This product was written from scratch in Rust. Its design draws on
+claude-swap (https://github.com/realiti4/claude-swap), which is released
+under the MIT License. No claude-swap source code is included.
+
+claude-cx is not affiliated with, endorsed by or supported by Anthropic.
+"Claude" and "Claude Code" are trademarks of Anthropic, PBC.

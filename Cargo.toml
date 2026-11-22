@@ -1,0 +1,50 @@
+[package]
+name = "claude-cx"
+version = "0.4.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Several Claude accounts behind one Claude Code: a dashboard that shows each account's limits and what used them, and switches to the one with the most room"
+license = "Apache-2.0"
+repository = "https://github.com/protoworks-dev/claude-cx"
+homepage = "https://github.com/protoworks-dev/claude-cx"
+documentation = "https://docs.rs/claude-cx"
+readme = "README.md"
+keywords = ["claude", "claude-code", "accounts", "tui", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [".github/", "tests/"]
+
+[[bin]]
+name = "cx"
+path = "src/main.rs"
+
+[lib]
+name = "claude_cx"
+path = "src/lib.rs"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "allow"
+
+[dependencies]
+age = { version = "0.12", features = ["armor"] }
+anyhow = "1.0.104"
+chrono = "0.4.45"
+clap = { version = "4.6.9", features = ["derive"] }
+clap_complete = "4.6.12"
+fastrand = "2.5.0"
+libc = "0.2.191"
+memchr = "2.8.3"
+ratatui = "0.30"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+sha2 = "0.11.1"
+unicode-normalization = "0.1.26"
+ureq = { version = "3", features = ["json"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tao = "0.37.3"
+tray-icon = "0.26.1"
