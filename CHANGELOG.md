@@ -4,6 +4,10 @@ All notable changes are recorded here. The format follows [Keep a Changelog](htt
 
 ## Unreleased
 
+### Fixed
+
+- Switching or renewing a login no longer signs Claude Code out when its Keychain item is large. Since 0.5.0, a login that also held MCP server sign-ins (anything too long for the `security` tool's standard input) was moved to the plaintext file and the Keychain item removed; Claude Code on macOS reads only the Keychain item, so it was left signed out. The item now stays in the Keychain. 0.4.0 is not affected.
+
 ### Added
 
 - `keep_awake` setting (off by default, macOS). With the plugin's hooks, the end of a turn on a large conversation holds the Mac awake for 80 minutes, so Claude Code can summarise the conversation before its cache expires. Sending a prompt or ending the session releases it. Without this, a Mac that sleeps first pays for the whole conversation again on the next prompt.

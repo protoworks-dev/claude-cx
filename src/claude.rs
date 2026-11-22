@@ -191,14 +191,16 @@ impl ClaudeHome {
                             return Ok(());
                         }
                     }
-                    // Too long to hand to `security` without showing it in
-                    // the process list. The whole object goes to the
-                    // owner-only file, which Claude Code also reads, and
-                    // the item is removed so its older login cannot win.
+                    // Too long for the tool's standard input: the item also
+                    // holds the sign-ins of MCP servers. On macOS Claude
+                    // Code reads this item and not the file, so it has to
+                    // stay in the Keychain; removing it signs Claude Code
+                    // out. It is written the way Claude Code writes it.
                     secrets::Written::TooLarge => {
-                        util::mkdir_private(&self.dir)?;
-                        util::atomic_write(&file, merged.as_bytes(), 0o600)?;
-                        return secrets::keychain_delete(&service, &user);
+                        secrets::keychain_set_long(&service, &user, &merged)?;
+                        if file_text.is_none() {
+                            return Ok(());
+                        }
                     }
                 }
             }

@@ -133,6 +133,42 @@ pub fn keychain_set(service: &str, account: &str, value: &str) -> Result<Written
     Ok(Written::Stored)
 }
 
+/// Store a value too long for [`keychain_set`] in the Keychain item for
+/// `service` and `account`, by passing it to `security` as an argument in
+/// hexadecimal.
+///
+/// An argument can be seen in the process list by other users of the
+/// machine for the moment the command runs, which is why [`keychain_set`]
+/// never does this. It is used for one item only: Claude Code's own login,
+/// when it holds more than fits on the tool's standard input (it also
+/// carries the sign-ins of MCP servers, tens of kilobytes). Claude Code
+/// reads that item and nothing else on macOS, and writes it this same way,
+/// so the alternative is to leave Claude Code signed out.
+pub fn keychain_set_long(service: &str, account: &str, value: &str) -> Result<()> {
+    // Well under the limit on a command's arguments.
+    const MAX_HEX: usize = 900_000;
+    let hex: String = value.bytes().map(|b| format!("{b:02x}")).collect();
+    if hex.len() > MAX_HEX {
+        bail!(
+            "the login for '{service}' is too large to store ({} bytes)",
+            value.len()
+        );
+    }
+    let out = run_bounded(
+        Command::new(SECURITY).args(["add-generic-password", "-U", "-a", account, "-s", service, "-X", &hex]),
+        None,
+        TIMEOUT,
+    )?;
+    if out.code != 0 {
+        bail!(
+            "Keychain write of '{service}' failed (exit {}): {}",
+            out.code,
+            out.stderr.trim()
+        );
+    }
+    Ok(())
+}
+
 /// Delete the Keychain item for `service` and `account` by running
 /// `security`. Succeeds when the item was already gone.
 pub fn keychain_delete(service: &str, account: &str) -> Result<()> {
@@ -248,22 +284,44 @@ mod tests {
         // Too long for stdin: refused, and the item is left as it was.
         assert_eq!(keychain_set(service, &user, &big).unwrap(), Written::TooLarge);
         assert_eq!(keychain_get(service, &user).unwrap().as_deref(), Some(small.as_str()));
+        // The long form stores it, at the size of a real login that also
+        // holds MCP sign-ins, and a later short write replaces it.
+        let huge = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"at"}},"mcpOAuth":"{}"}}"#,
+            "z\"".repeat(15_000)
+        );
+        for value in [&big, &huge] {
+            keychain_set_long(service, &user, value).unwrap();
+            assert_eq!(keychain_get(service, &user).unwrap().as_deref(), Some(value.as_str()));
+        }
+        assert_eq!(keychain_set(service, &user, &small).unwrap(), Written::Stored);
+        assert_eq!(keychain_get(service, &user).unwrap().as_deref(), Some(small.as_str()));
         keychain_delete(service, &user).unwrap();
         assert_eq!(keychain_get(service, &user).unwrap(), None);
         keychain_delete(service, &user).unwrap();
     }
 
     #[test]
-    fn a_value_only_ever_goes_to_security_on_stdin() {
+    fn cx_secrets_only_ever_go_to_security_on_stdin() {
         let line = store_line("svc", "me", "ab").unwrap();
         assert_eq!(line, "add-generic-password -U -a \"me\" -s \"svc\" -X 6162\n");
         // One byte under the buffer fits; a long value is refused, not
         // passed some other way.
         assert!(store_line("svc", "me", &"x".repeat(1900)).is_some());
         assert!(store_line("svc", "me", &"x".repeat(2100)).is_none());
-        // The only way this module starts `security` with a value is `-i`.
+        // The only place a value goes on a command line is the long form,
+        // which nothing in this module calls: cx's own secrets never use it.
         let source = include_str!("secrets.rs");
         let code = source.split("#[cfg(test)]").next().unwrap();
-        assert!(!code.contains("\"-X\""), "a value is being put on a command line");
+        assert_eq!(
+            code.matches("\"-X\"").count(),
+            1,
+            "a value is being put on a command line"
+        );
+        assert_eq!(
+            code.matches("keychain_set_long(").count(),
+            1,
+            "only its definition may appear here"
+        );
     }
 }
