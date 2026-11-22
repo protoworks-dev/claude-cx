@@ -16,6 +16,8 @@ cargo fmt --check
 cargo doc --no-deps           # rustdoc must build without warnings
 ```
 
+To check what would be published, build the package into its own directory: `cargo package --target-dir /tmp/claude-cx-package`. Verifying into the normal `target/` leaves artifacts that cargo then treats as the current build, and the end-to-end tests run against that snapshot until `cargo clean -p claude-cx`.
+
 The end-to-end tests run the real binary against a temporary home, file-backed secrets and a local stand-in for Anthropic's endpoints. They cannot reach your Keychain, your `~/.claude` or the network. Keep it that way: a test must never need a real account.
 
 To try a build by hand without touching your real accounts:
