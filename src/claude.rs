@@ -272,6 +272,39 @@ mod tests {
         assert_eq!(home.keychain_service().len(), "Claude Code-credentials-".len() + 8);
     }
 
+    /// The case that signed a user out: a login of real size, with MCP
+    /// sign-ins beside it, is replaced and must still be in the Keychain.
+    /// Run by hand: `cargo test --lib a_large_login -- --ignored`.
+    #[test]
+    #[ignore = "touches the real macOS Keychain"]
+    fn a_large_login_stays_in_the_keychain_when_replaced() {
+        let dir = std::env::temp_dir().join(format!("cx-claude-home-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let home = ClaudeHome::at(dir.clone());
+        let (service, user) = (home.keychain_service(), secrets::keychain_user());
+        let login = |token: &str, expires: i64| serde_json::json!({"accessToken": token, "refreshToken": format!("r-{token}"), "expiresAt": expires});
+        let mcp = "m".repeat(43_000);
+        let before = serde_json::json!({"claudeAiOauth": login("old", 1), "mcpOAuth": {"server": mcp}}).to_string();
+        secrets::keychain_set_long(&service, &user, &before).unwrap();
+
+        let new = serde_json::json!({"claudeAiOauth": login("new", 2)}).to_string();
+        home.write_oauth(&Oauth::from_credential(&new).unwrap()).unwrap();
+
+        let stored = secrets::keychain_get(&service, &user)
+            .unwrap()
+            .expect("the item is still there");
+        let stored: Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(stored["claudeAiOauth"]["accessToken"], "new");
+        assert_eq!(stored["mcpOAuth"]["server"].as_str().map(str::len), Some(43_000));
+        assert!(
+            !home.credential_file().exists(),
+            "nothing was moved to the plaintext file"
+        );
+        assert_eq!(home.read_oauth().unwrap().unwrap().0["accessToken"], "new");
+        home.delete_credentials().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn identity_needs_an_account_uuid() {
         let v: Value = serde_json::json!({"accountUuid": "u", "organizationUuid": "o"});
