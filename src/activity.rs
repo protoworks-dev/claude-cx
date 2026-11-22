@@ -20,7 +20,7 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// Bumped when what is kept per file changes, so old sums are read again.
-const CACHE_VERSION: u32 = 4;
+const CACHE_VERSION: u32 = 5;
 /// Days of activity kept and shown.
 pub const DAYS: i64 = 7;
 /// A reply that wrote this many tokens to the cache while reading fewer
@@ -177,6 +177,149 @@ impl Waste {
     }
 }
 
+/// What a [`Tally`] counts. Each kind says what `count`, `a` and `b` hold.
+pub mod kind {
+    /// One hook command: runs, milliseconds waited, characters it added to
+    /// the conversation.
+    pub const HOOK: &str = "hook";
+    /// A hook that blocked or was cancelled: times.
+    pub const HOOK_TROUBLE: &str = "hook-trouble";
+    /// What a tool returned: results, characters, results that were errors.
+    pub const TOOL_OUTPUT: &str = "tool-output";
+    /// A tool call that was refused, by who refused it: times.
+    pub const DENIED: &str = "denied";
+    /// Replies at one effort level: replies, output tokens, of which thinking.
+    pub const EFFORT: &str = "effort";
+    /// Replies made while a skill was in charge: replies, output tokens,
+    /// tokens of conversation sent.
+    pub const SKILL: &str = "by-skill";
+    /// The same for a plugin.
+    pub const PLUGIN: &str = "by-plugin";
+    /// The same for an MCP server.
+    pub const MCP: &str = "by-mcp";
+    /// Requests the API refused, by status and type: times.
+    pub const API_ERROR: &str = "api-error";
+    /// Cache writes by lifetime (`1h` or `5m`): replies, tokens written.
+    pub const CACHE_LIFE: &str = "cache-life";
+    /// Finished turns: turns, milliseconds from prompt to finish.
+    pub const TURNS: &str = "turns";
+    /// A list sent at the start of every session (`skills`, `agents`):
+    /// sessions, characters, entries.
+    pub const LISTING: &str = "listing";
+    /// Conversations summarised while idle, before their cache expired: times.
+    pub const IDLE_SUMMARY: &str = "idle-summary";
+    /// Replies cut short (`stream cut`, `truncated`): times.
+    pub const CUT: &str = "cut";
+}
+
+/// One counted thing of a [`kind`], summed over a span of days.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Tally {
+    /// What was counted: a hook command, a tool, an effort level.
+    pub name: String,
+    /// How many.
+    pub count: u64,
+    /// The kind's first amount (see [`kind`]).
+    pub a: u64,
+    /// The kind's second amount.
+    pub b: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct TallyRow {
+    day: String,
+    owner: String,
+    #[serde(rename = "k")]
+    kind: String,
+    name: String,
+    #[serde(default, rename = "n")]
+    count: u64,
+    #[serde(default)]
+    a: u64,
+    #[serde(default)]
+    b: u64,
+}
+
+/// The length of a JSON value's text, without keeping the text: the bytes
+/// of a string, or of every string inside a list or object. Image data is
+/// left out, since a picture is not charged by its characters.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Len(u64);
+
+impl<'de> Deserialize<'de> for Len {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Len, D::Error> {
+        struct Visit;
+        impl<'de> serde::de::Visitor<'de> for Visit {
+            type Value = Len;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Len, E> {
+                Ok(Len(v.len() as u64))
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Len, E> {
+                Ok(Len(0))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Len, E> {
+                Ok(Len(0))
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Len, E> {
+                Ok(Len(0))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Len, E> {
+                Ok(Len(0))
+            }
+            fn visit_unit<E>(self) -> Result<Len, E> {
+                Ok(Len(0))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Len, A::Error> {
+                let mut total = 0;
+                while let Some(Len(n)) = seq.next_element()? {
+                    total += n;
+                }
+                Ok(Len(total))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Len, A::Error> {
+                let mut total = 0;
+                while let Some(key) = map.next_key::<std::borrow::Cow<str>>()? {
+                    if key == "data" || key == "type" {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    } else {
+                        total += map.next_value::<Len>()?.0;
+                    }
+                }
+                Ok(Len(total))
+            }
+        }
+        deserializer.deserialize_any(Visit)
+    }
+}
+
+/// A short name for a hook from its command: the script and its
+/// arguments, without the interpreter and the directories.
+fn hook_label(command: &str) -> String {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let script = words.iter().position(|w| w.contains('/')).unwrap_or(0);
+    let mut label: Vec<String> = Vec::new();
+    for (i, word) in words.iter().enumerate().skip(script) {
+        let word = word.trim_matches(|c| c == '"' || c == '\'');
+        if word.starts_with("||") || word.starts_with("&&") || word == ">/dev/null" {
+            break;
+        }
+        label.push(if i == script || word.contains('/') {
+            word.rsplit('/').next().unwrap_or(word).to_string()
+        } else {
+            word.to_string()
+        });
+    }
+    let label = label.join(" ");
+    if label.is_empty() {
+        "(unnamed)".into()
+    } else {
+        label.chars().take(48).collect()
+    }
+}
+
 /// [`Waste`] for one account, day and project.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WasteRow {
@@ -279,6 +422,8 @@ struct FileSums {
     after_stop: bool,
     #[serde(default)]
     last_project: String,
+    #[serde(default)]
+    tally: Vec<TallyRow>,
 }
 
 /// The sums for every transcript changed in the last [`DAYS`] days, keyed by
@@ -310,6 +455,24 @@ struct UsageJson {
     cache_creation_input_tokens: u64,
     #[serde(default)]
     cache_read_input_tokens: u64,
+    #[serde(default)]
+    cache_creation: CacheLife,
+    #[serde(default)]
+    output_tokens_details: OutputDetails,
+}
+
+#[derive(Deserialize, Default)]
+struct CacheLife {
+    #[serde(default)]
+    ephemeral_1h_input_tokens: u64,
+    #[serde(default)]
+    ephemeral_5m_input_tokens: u64,
+}
+
+#[derive(Deserialize, Default)]
+struct OutputDetails {
+    #[serde(default)]
+    thinking_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -318,6 +481,8 @@ struct Block {
     kind: String,
     #[serde(default)]
     name: String,
+    #[serde(default)]
+    id: String,
     #[serde(default)]
     input: BlockInput,
 }
@@ -358,6 +523,42 @@ struct CompactJson {
     trigger: String,
     #[serde(rename = "preTokens", default)]
     pre_tokens: u64,
+    #[serde(rename = "durationMs", default)]
+    duration_ms: f64,
+}
+
+#[derive(Deserialize)]
+struct ResultBlock {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    tool_use_id: String,
+    #[serde(default)]
+    content: Len,
+    #[serde(default)]
+    is_error: bool,
+}
+
+#[derive(Deserialize, Default)]
+struct ResultMessage {
+    #[serde(default)]
+    content: Vec<ResultBlock>,
+}
+
+#[derive(Deserialize)]
+struct ResultLine {
+    #[serde(default)]
+    timestamp: String,
+    #[serde(default)]
+    message: ResultMessage,
+    #[serde(rename = "toolDenialKind", default)]
+    denial: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TurnLine {
+    #[serde(default)]
+    timestamp: String,
     #[serde(rename = "durationMs", default)]
     duration_ms: f64,
 }
@@ -443,6 +644,22 @@ struct AssistantLine {
     request_id: String,
     #[serde(rename = "attributionAgent", default)]
     attribution_agent: Option<String>,
+    #[serde(rename = "attributionSkill", default)]
+    by_skill: Option<String>,
+    #[serde(rename = "attributionPlugin", default)]
+    by_plugin: Option<String>,
+    #[serde(rename = "attributionMcpServer", default)]
+    by_mcp: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
+    #[serde(rename = "apiErrorStatus", default)]
+    error_status: Option<serde_json::Value>,
+    #[serde(rename = "apiErrorType", default)]
+    error_type: Option<String>,
+    #[serde(rename = "streamCutCause", default)]
+    cut: Option<String>,
+    #[serde(rename = "truncatedAfterOutput", default)]
+    truncated: bool,
     #[serde(default)]
     message: MessageJson,
 }
@@ -453,6 +670,19 @@ struct HookJson {
     event: String,
     #[serde(rename = "durationMs", default)]
     duration_ms: f64,
+    #[serde(rename = "hookName", default)]
+    name: String,
+    #[serde(default)]
+    command: String,
+    /// What the hook added to the conversation.
+    #[serde(default)]
+    content: Len,
+    #[serde(rename = "skillCount", default)]
+    skill_count: u64,
+    #[serde(rename = "isInitial", default)]
+    initial: bool,
+    #[serde(rename = "addedLines", default)]
+    added_lines: Vec<serde::de::IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -516,12 +746,31 @@ pub fn model_name(id: &str) -> String {
     }
 }
 
+/// Day, account, kind and name.
+type TallyKey = (String, String, &'static str, String);
+
 struct Pending {
     rows: HashMap<(String, String, String, String, String), Tokens>,
     hooks: HashMap<(String, String, String), (u64, u64)>,
     tools: HashMap<(String, String, String), u64>,
     skills: HashMap<(String, String, String), u64>,
     waste: HashMap<(String, String, String), Waste>,
+    /// Day, account, kind and name, to count and two amounts.
+    tally: HashMap<TallyKey, (u64, u64, u64)>,
+    /// Tool call ids to tool names, to name the tool a result belongs to.
+    ids: HashMap<String, String>,
+}
+
+impl Pending {
+    fn count(&mut self, day: &str, owner: &str, kind: &'static str, name: &str, a: u64, b: u64) {
+        let entry = self
+            .tally
+            .entry((day.to_string(), owner.to_string(), kind, name.to_string()))
+            .or_default();
+        entry.0 += 1;
+        entry.1 += a;
+        entry.2 += b;
+    }
 }
 
 impl FileSums {
@@ -543,6 +792,8 @@ impl FileSums {
             tools: HashMap::new(),
             skills: HashMap::new(),
             waste: HashMap::new(),
+            tally: HashMap::new(),
+            ids: HashMap::new(),
         };
         let mut seen: HashSet<String> = HashSet::new();
         seen.insert(self.last_request.clone());
@@ -571,6 +822,15 @@ impl FileSums {
                     && let Some((day, _)) = day_of(&hook.timestamp)
                     && day.as_str() >= oldest_day
                 {
+                    let label = format!("{} · {}", hook.attachment.name, hook_label(&hook.attachment.command));
+                    pending.count(
+                        &day,
+                        &self.owner,
+                        kind::HOOK,
+                        &label,
+                        hook.attachment.duration_ms.max(0.0) as u64,
+                        hook.attachment.content.0,
+                    );
                     let entry = pending
                         .hooks
                         .entry((day, self.owner.clone(), hook.attachment.event))
@@ -596,11 +856,29 @@ impl FileSums {
                         waste.summary_ms += compact.meta.duration_ms.max(0.0) as u64;
                     }
                 }
+            } else if find(&line, b"\"type\":\"user\"") {
+                if find(&line, b"\"type\":\"tool_result\"") {
+                    self.tool_result(&line, oldest_day, &mut pending);
+                } else if agent_type.is_empty() {
+                    self.prompt(&line, oldest_day, &mut pending);
+                }
+            } else if find(&line, b"\"type\":\"attachment\"") {
+                self.attachment(&line, oldest_day, &mut pending);
             } else if agent_type.is_empty()
-                && find(&line, b"\"type\":\"user\"")
-                && !find(&line, b"\"type\":\"tool_result\"")
+                && find(&line, b"\"subtype\":\"turn_duration\"")
+                && let Ok(turn) = serde_json::from_slice::<TurnLine>(&line)
+                && let Some((day, _)) = day_of(&turn.timestamp)
+                && day.as_str() >= oldest_day
             {
-                self.prompt(&line, oldest_day, &mut pending);
+                pending.count(&day, &self.owner, kind::TURNS, "", turn.duration_ms.max(0.0) as u64, 0);
+            } else if line.len() < 2000
+                && find(&line, b"Compacted while idle")
+                && find(&line, b"\"subtype\":\"informational\"")
+                && let Ok(note) = serde_json::from_slice::<TurnLine>(&line)
+                && let Some((day, _)) = day_of(&note.timestamp)
+                && day.as_str() >= oldest_day
+            {
+                pending.count(&day, &self.owner, kind::IDLE_SUMMARY, "", 0, 0);
             }
         }
         self.size = size;
@@ -653,6 +931,28 @@ impl FileSums {
                 }),
             }
         }
+        for ((day, owner, kind, name), (count, a, b)) in pending.tally {
+            match self
+                .tally
+                .iter_mut()
+                .find(|t| t.day == day && t.owner == owner && t.kind == kind && t.name == name)
+            {
+                Some(row) => {
+                    row.count += count;
+                    row.a += a;
+                    row.b += b;
+                }
+                None => self.tally.push(TallyRow {
+                    day,
+                    owner,
+                    kind: kind.to_string(),
+                    name,
+                    count,
+                    a,
+                    b,
+                }),
+            }
+        }
         for ((day, owner, tool), calls) in pending.skills {
             match self
                 .skills
@@ -695,6 +995,90 @@ impl FileSums {
             "(unknown)".into()
         } else {
             self.last_project.clone()
+        }
+    }
+
+    /// What tools returned: how much text went into the conversation, how
+    /// often it was an error, and calls that were refused.
+    fn tool_result(&mut self, line: &[u8], oldest_day: &str, pending: &mut Pending) {
+        let Ok(result) = serde_json::from_slice::<ResultLine>(line) else {
+            return;
+        };
+        let Some((day, _)) = day_of(&result.timestamp) else {
+            return;
+        };
+        if day.as_str() < oldest_day {
+            return;
+        }
+        for block in result.message.content.iter().filter(|b| b.kind == "tool_result") {
+            let tool = pending
+                .ids
+                .get(&block.tool_use_id)
+                .cloned()
+                .unwrap_or_else(|| "(earlier call)".into());
+            if let Some(denial) = &result.denial {
+                pending.count(&day, &self.owner, kind::DENIED, &format!("{denial} · {tool}"), 0, 0);
+            } else {
+                pending.count(
+                    &day,
+                    &self.owner,
+                    kind::TOOL_OUTPUT,
+                    &tool,
+                    block.content.0,
+                    block.is_error as u64,
+                );
+            }
+        }
+    }
+
+    /// Hooks that blocked or were cancelled, and the lists sent at the
+    /// start of a session.
+    fn attachment(&mut self, line: &[u8], oldest_day: &str, pending: &mut Pending) {
+        let trouble = if find(line, b"\"type\":\"hook_blocking_error\"") {
+            "blocked"
+        } else if find(line, b"\"type\":\"hook_cancelled\"") {
+            "cancelled"
+        } else if find(line, b"\"type\":\"hook_non_blocking_error\"") {
+            "failed"
+        } else {
+            ""
+        };
+        let skills = trouble.is_empty() && find(line, b"\"type\":\"skill_listing\"");
+        let agents = trouble.is_empty() && !skills && find(line, b"\"type\":\"agent_listing_delta\"");
+        if trouble.is_empty() && !skills && !agents {
+            return;
+        }
+        let Ok(hook) = serde_json::from_slice::<HookLine>(line) else {
+            return;
+        };
+        let Some((day, _)) = day_of(&hook.timestamp) else {
+            return;
+        };
+        if day.as_str() < oldest_day {
+            return;
+        }
+        let a = hook.attachment;
+        if !trouble.is_empty() {
+            pending.count(
+                &day,
+                &self.owner,
+                kind::HOOK_TROUBLE,
+                &format!("{trouble} · {}", a.name),
+                0,
+                0,
+            );
+        } else if a.initial && skills {
+            pending.count(&day, &self.owner, kind::LISTING, "skills", a.content.0, a.skill_count);
+        } else if a.initial && agents {
+            // The line's own length stands for the list's: it holds little else.
+            pending.count(
+                &day,
+                &self.owner,
+                kind::LISTING,
+                "agents",
+                line.len() as u64,
+                a.added_lines.len() as u64,
+            );
         }
     }
 
@@ -758,6 +1142,13 @@ impl FileSums {
         let Ok(reply) = serde_json::from_slice::<AssistantLine>(line) else {
             return;
         };
+        if let Some(status) = &reply.error_status
+            && let Some((day, _)) = day_of(&reply.timestamp)
+            && day.as_str() >= oldest_day
+        {
+            let name = format!("{status} {}", reply.error_type.as_deref().unwrap_or(""));
+            pending.count(&day, &self.owner, kind::API_ERROR, name.trim(), 0, 0);
+        }
         let Some(usage) = reply.message.usage else { return };
         if reply.message.model.is_empty() || reply.message.model.starts_with('<') {
             return;
@@ -781,6 +1172,9 @@ impl FileSums {
                 && block.kind == "tool_use"
                 && !block.name.is_empty()
             {
+                if !block.id.is_empty() {
+                    pending.ids.insert(block.id.clone(), block.name.clone());
+                }
                 if block.name == "Skill" && !block.input.skill.is_empty() {
                     *pending
                         .skills
@@ -811,6 +1205,39 @@ impl FileSums {
             self.last_request = reply.request_id;
         }
         self.turn_output += usage.output_tokens;
+        let sent = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
+        let owner = self.owner.clone();
+        pending.count(
+            &day,
+            &owner,
+            kind::EFFORT,
+            reply.effort.as_deref().unwrap_or("(not recorded)"),
+            usage.output_tokens,
+            usage.output_tokens_details.thinking_tokens,
+        );
+        for (kind, name) in [
+            (kind::SKILL, &reply.by_skill),
+            (kind::PLUGIN, &reply.by_plugin),
+            (kind::MCP, &reply.by_mcp),
+        ] {
+            if let Some(name) = name.as_deref().filter(|n| !n.is_empty()) {
+                pending.count(&day, &owner, kind, name, usage.output_tokens, sent);
+            }
+        }
+        for (life, tokens) in [
+            ("1h", usage.cache_creation.ephemeral_1h_input_tokens),
+            ("5m", usage.cache_creation.ephemeral_5m_input_tokens),
+        ] {
+            if tokens > 0 {
+                pending.count(&day, &owner, kind::CACHE_LIFE, life, tokens, 0);
+            }
+        }
+        if let Some(cause) = &reply.cut {
+            pending.count(&day, &owner, kind::CUT, &format!("stream cut: {cause}"), 0, 0);
+        }
+        if reply.truncated {
+            pending.count(&day, &owner, kind::CUT, "truncated after output", 0, 0);
+        }
         let rebuilt = usage.cache_creation_input_tokens >= REBUILD_TOKENS
             && usage.cache_read_input_tokens < usage.cache_creation_input_tokens;
         let project = self.project_for(&reply.cwd);
@@ -870,6 +1297,7 @@ impl FileSums {
         self.tools.retain(|r| r.day.as_str() >= oldest_day);
         self.compactions.retain(|(day, _)| day.as_str() >= oldest_day);
         self.waste.retain(|r| r.day.as_str() >= oldest_day);
+        self.tally.retain(|r| r.day.as_str() >= oldest_day);
         self.skills.retain(|r| r.day.as_str() >= oldest_day);
         self.edits.retain(|_, (day, _)| day.as_str() >= oldest_day);
     }
@@ -1082,6 +1510,7 @@ impl Activity {
         let mut summary = Summary::default();
         let mut skills: BTreeMap<String, u64> = BTreeMap::new();
         let mut by_project: BTreeMap<String, Waste> = BTreeMap::new();
+        let mut tallies: BTreeMap<String, BTreeMap<String, Tally>> = BTreeMap::new();
         let mut models: BTreeMap<String, Tokens> = BTreeMap::new();
         let mut projects: BTreeMap<String, Tokens> = BTreeMap::new();
         let mut agents: BTreeMap<String, Tokens> = BTreeMap::new();
@@ -1135,6 +1564,21 @@ impl Activity {
             {
                 *skills.entry(row.tool.clone()).or_default() += row.calls;
             }
+            for row in file
+                .tally
+                .iter()
+                .filter(|r| is(&r.owner) && r.day.as_str() >= since_day)
+            {
+                let tally = tallies
+                    .entry(row.kind.clone())
+                    .or_default()
+                    .entry(row.name.clone())
+                    .or_default();
+                tally.name.clone_from(&row.name);
+                tally.count += row.count;
+                tally.a += row.a;
+                tally.b += row.b;
+            }
             if is(&file.owner) {
                 summary.churn.extend(
                     file.edits
@@ -1144,6 +1588,15 @@ impl Activity {
                 );
             }
         }
+        summary.tallies = tallies
+            .into_iter()
+            .map(|(kind, rows)| {
+                let mut rows: Vec<Tally> = rows.into_values().collect();
+                // Biggest first, by the first amount and then by how many.
+                rows.sort_by(|x, y| (y.a, y.count).cmp(&(x.a, x.count)).then_with(|| x.name.cmp(&y.name)));
+                (kind, rows)
+            })
+            .collect();
         summary.skills = skills.into_iter().collect();
         summary.skills.sort_by_key(|s| std::cmp::Reverse(s.1));
         summary.churn.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -1353,6 +1806,15 @@ pub struct Summary {
     /// the number of edits, most edited first. A file listed twice was
     /// worked over in two conversations.
     pub churn: Vec<(String, u32)>,
+    /// Everything else that was counted, by [`kind`], biggest first.
+    pub tallies: BTreeMap<String, Vec<Tally>>,
+}
+
+impl Summary {
+    /// The tallies of one [`kind`], biggest first; empty when none.
+    pub fn tally(&self, kind: &str) -> &[Tally] {
+        self.tallies.get(kind).map_or(&[], Vec::as_slice)
+    }
 }
 
 /// The model Claude Code used last, from the tail of the newest transcript.

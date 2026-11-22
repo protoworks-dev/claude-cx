@@ -10,6 +10,8 @@ All notable changes are recorded here. The format follows [Keep a Changelog](htt
 
 ### Added
 
+- More is read from the transcripts, all of it kept as counts on this machine: thinking tokens by effort level, cache writes by lifetime, how much text each tool put into conversations and how often it failed, time and added text per hook command, hooks that blocked or were cancelled, refused tool calls, work done under each skill, plugin and MCP server, API errors, turn times, the size of the lists sent at every session start, and summaries made while idle. `cx report` carries them all.
+- The dashboard's cards are on two pages, "Usage" and "Waste and speed" (`v`, or click). A line above the cards names the largest loss of tokens and of time. Cards carry their headline figure in the title.
 - `keep_awake` setting (off by default, macOS). With the plugin's hooks, the end of a turn on a large conversation holds the Mac awake for 80 minutes, so Claude Code can summarise the conversation before its cache expires. Sending a prompt or ending the session releases it. Without this, a Mac that sleeps first pays for the whole conversation again on the next prompt.
 
 ## 0.5.0 - 2026-11-22

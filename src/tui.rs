@@ -11,7 +11,7 @@
 //! and locks are on a worker thread; the transcripts are read on another.
 
 use crate::accounts;
-use crate::activity::{self, Activity, Summary, Tokens};
+use crate::activity::{self, Activity, Summary, Tokens, kind};
 use crate::claude::ClaudeHome;
 use crate::engine::{Engine, Snapshot};
 use crate::history::{self, Forecast, History, Key};
@@ -698,6 +698,8 @@ enum Hit {
     Setting(&'static str),
     /// The breakdown's period: today only, or the last 7 days.
     Period(bool),
+    /// The page of cards.
+    Page(usize),
 }
 
 /// What the main loop does itself, because it needs the terminal or the
@@ -729,6 +731,8 @@ struct App {
     /// Whether closing a value editor returns to the settings list.
     back_to_settings: bool,
     today_only: bool,
+    /// Which page of cards is shown.
+    page: usize,
     focus: Focus,
     /// The selected account, by number, so it stays put when the order moves.
     selected: Option<u32>,
@@ -755,6 +759,7 @@ impl App {
             summary: None,
             back_to_settings: false,
             today_only: false,
+            page: 0,
             focus: Focus::Accounts,
             selected: None,
             selected_key: None,
@@ -1606,7 +1611,12 @@ fn short(n: u64) -> String {
 
 /// A titled box. Returns the area inside it.
 fn card(frame: &mut Frame, area: Rect, title: String) -> Rect {
-    let block = Block::bordered()
+    card_with(frame, area, title, String::new())
+}
+
+/// A card whose top border also carries a headline figure on the right.
+fn card_with(frame: &mut Frame, area: Rect, title: String, headline: String) -> Rect {
+    let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(faint()))
         .padding(Padding::horizontal(1))
@@ -1614,6 +1624,9 @@ fn card(frame: &mut Frame, area: Rect, title: String) -> Rect {
             format!(" {title} "),
             Style::new().fg(accent()).add_modifier(Modifier::BOLD),
         ));
+    if !headline.is_empty() && area.width as usize > title.chars().count() + headline.chars().count() + 8 {
+        block = block.title_top(Line::from(Span::styled(format!(" {headline} "), bold())).right_aligned());
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
     inner
@@ -1689,10 +1702,92 @@ enum CardKind {
     Days,
     Projects,
     Tools,
-    Hooks,
     Limits,
     Waste,
     Skills,
+    Thinking,
+    Causes,
+    ToolOutput,
+    HookCommands,
+    Startup,
+    Trouble,
+    Churn,
+}
+
+/// The two pages of cards: what used the account, and what was lost.
+const PAGES: [(&str, &[CardKind]); 2] = [
+    (
+        "Usage",
+        &[
+            CardKind::Models,
+            CardKind::Who,
+            CardKind::Projects,
+            CardKind::Days,
+            CardKind::Tools,
+            CardKind::Skills,
+            CardKind::Thinking,
+            CardKind::Limits,
+        ],
+    ),
+    (
+        "Waste and speed",
+        &[
+            CardKind::Waste,
+            CardKind::Causes,
+            CardKind::Cache,
+            CardKind::ToolOutput,
+            CardKind::HookCommands,
+            CardKind::Startup,
+            CardKind::Trouble,
+            CardKind::Churn,
+        ],
+    ),
+];
+
+/// The largest loss of tokens and the largest loss of time, in a sentence
+/// each, for the line above the cards.
+fn findings(summary: &Summary) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let w = &summary.waste;
+    let worst = w
+        .rebuilds
+        .iter()
+        .filter(|(cause, _)| cause.as_str() != activity::cause::START)
+        .max_by_key(|(_, (_, tokens))| *tokens);
+    let mut tokens: Vec<(u64, String)> = Vec::new();
+    if let Some((cause, (count, lost))) = worst {
+        tokens.push((
+            *lost,
+            format!("cache rebuilt {}: {cause}", plural(*count, "time", "times")),
+        ));
+    }
+    tokens.push((
+        w.lost_output * 5,
+        format!(
+            "{} you stopped, {} tokens already written",
+            plural(w.stops + w.tool_stops, "turn", "turns"),
+            compact(w.lost_output)
+        ),
+    ));
+    if let Some((lost, what)) = tokens
+        .into_iter()
+        .filter(|(lost, _)| *lost > 0)
+        .max_by_key(|(lost, _)| *lost)
+    {
+        found.push(("Most tokens lost".into(), format!("{what} · {}", compact(lost))));
+    }
+    if let Some(slow) = summary.tally(kind::HOOK).first().filter(|t| t.a >= 60_000) {
+        found.push((
+            "Most time lost".into(),
+            format!(
+                "hook {} · {} over {}",
+                slow.name,
+                human_duration((slow.a / 1000) as i64),
+                plural(slow.count, "run", "runs")
+            ),
+        ));
+    }
+    found
 }
 
 /// What the cards draw from.
@@ -1772,44 +1867,10 @@ fn draw_card(frame: &mut Frame, area: Rect, kind: CardKind, b: &Breakdown) {
                 .collect();
             share_table(frame, inner, &["Tool", "calls"], rows);
         }
-        CardKind::Hooks => {
-            let waited: u64 = summary.hooks.iter().map(|h| h.2).sum();
-            let inner = card(
-                frame,
-                area,
-                format!("Hooks · {} waiting", human_duration((waited / 1000) as i64)),
-            );
-            if summary.hooks.is_empty() {
-                frame.render_widget(Paragraph::new(Span::styled("none ran", dim())), inner);
-                return;
-            }
-            let rows = summary
-                .hooks
-                .iter()
-                .map(|(event, runs, ms)| {
-                    let each = ms / (*runs).max(1);
-                    ShareRow {
-                        name: event.clone(),
-                        share: *ms as f64 / waited.max(1) as f64,
-                        color: warn(),
-                        numbers: vec![
-                            compact(*runs),
-                            human_duration((*ms / 1000) as i64),
-                            if each >= 1000 {
-                                format!("{:.1}s", each as f64 / 1000.0)
-                            } else {
-                                format!("{each}ms")
-                            },
-                        ],
-                    }
-                })
-                .collect();
-            share_table(frame, inner, &["Hook", "runs", "waited", "each"], rows);
-        }
         CardKind::Cache => {
             let sent = total.input + total.cache_write + total.cache_read;
             let reused = total.cache_read as f64 / sent.max(1) as f64;
-            let inner = card(frame, area, "Cache".into());
+            let inner = card_with(frame, area, "Cache".into(), format!("{:.0}% reused", reused * 100.0));
             let [gauge, _, table, notes] = Layout::vertical([
                 Constraint::Length(1),
                 Constraint::Length(1),
@@ -1868,11 +1929,30 @@ fn draw_card(frame: &mut Frame, area: Rect, kind: CardKind, b: &Breakdown) {
             } else {
                 Line::from(Span::styled("No cache rebuilds mid-chat", dim()))
             }];
+            let life = |name: &str| {
+                summary
+                    .tally(kind::CACHE_LIFE)
+                    .iter()
+                    .find(|t| t.name == name)
+                    .map_or(0, |t| t.a)
+            };
+            if life("1h") + life("5m") > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "Written to last 1 hour: {} · 5 minutes: {}",
+                        compact(life("1h")),
+                        compact(life("5m"))
+                    ),
+                    dim(),
+                )));
+            }
+            let idle: u64 = summary.tally(kind::IDLE_SUMMARY).iter().map(|t| t.count).sum();
             if summary.compactions > 0 {
                 lines.push(Line::from(Span::styled(
                     format!(
-                        "Conversation compacted {}",
-                        plural(summary.compactions, "time", "times")
+                        "Summarised {}, {} of them while idle",
+                        plural(summary.compactions, "time", "times"),
+                        idle
                     ),
                     dim(),
                 )));
@@ -1968,6 +2048,206 @@ fn draw_card(frame: &mut Frame, area: Rect, kind: CardKind, b: &Breakdown) {
                 })
                 .collect();
             share_table(frame, inner, &["Skill", "times"], rows);
+        }
+        CardKind::Thinking => {
+            let rows_in = summary.tally(kind::EFFORT);
+            let output: u64 = rows_in.iter().map(|t| t.a).sum();
+            let thinking: u64 = rows_in.iter().map(|t| t.b).sum();
+            let inner = card_with(
+                frame,
+                area,
+                "Thinking, by effort".into(),
+                format!("{:.0}% of output", thinking as f64 / output.max(1) as f64 * 100.0),
+            );
+            let rows = rows_in
+                .iter()
+                .map(|t| ShareRow {
+                    name: t.name.clone(),
+                    share: t.a as f64 / output.max(1) as f64,
+                    color: violet(),
+                    numbers: vec![compact(t.count), compact(t.a), compact(t.b)],
+                })
+                .collect();
+            share_table(frame, inner, &["Effort", "replies", "output", "thinking"], rows);
+        }
+        CardKind::Causes => {
+            let (count, tokens) = summary.waste.avoidable_rebuilds();
+            let inner = card_with(
+                frame,
+                area,
+                "Why the cache was rebuilt".into(),
+                format!("{} tokens resent", compact(tokens)),
+            );
+            if count == 0 {
+                frame.render_widget(Paragraph::new(Span::styled("no rebuilds mid-chat", dim())), inner);
+                return;
+            }
+            let mut causes: Vec<(&String, &(u64, u64))> = summary
+                .waste
+                .rebuilds
+                .iter()
+                .filter(|(cause, _)| cause.as_str() != activity::cause::START)
+                .collect();
+            causes.sort_by_key(|(_, (_, lost))| std::cmp::Reverse(*lost));
+            let rows = causes
+                .into_iter()
+                .map(|(cause, (times, lost))| ShareRow {
+                    name: cause.clone(),
+                    share: *lost as f64 / tokens.max(1) as f64,
+                    color: warn(),
+                    numbers: vec![compact(*times), compact(*lost)],
+                })
+                .collect();
+            share_table(frame, inner, &["Cause", "times", "tokens"], rows);
+        }
+        CardKind::ToolOutput => {
+            let rows_in = summary.tally(kind::TOOL_OUTPUT);
+            let chars: u64 = rows_in.iter().map(|t| t.a).sum();
+            let inner = card_with(
+                frame,
+                area,
+                "What tools put in the chat".into(),
+                format!("about {} tokens", compact(chars / 4)),
+            );
+            let rows = rows_in
+                .iter()
+                .map(|t| ShareRow {
+                    name: tool_name(&t.name),
+                    share: t.a as f64 / chars.max(1) as f64,
+                    color: accent(),
+                    numbers: vec![
+                        compact(t.count),
+                        compact(t.a / 4),
+                        compact(t.a / 4 / t.count.max(1)),
+                        compact(t.b),
+                    ],
+                })
+                .collect();
+            share_table(frame, inner, &["Tool", "results", "tokens", "each", "errors"], rows);
+        }
+        CardKind::HookCommands => {
+            let rows_in = summary.tally(kind::HOOK);
+            let waited: u64 = rows_in.iter().map(|t| t.a).sum();
+            let inner = card_with(
+                frame,
+                area,
+                "Hooks".into(),
+                format!("{} waiting", human_duration((waited / 1000) as i64)),
+            );
+            if rows_in.is_empty() {
+                frame.render_widget(Paragraph::new(Span::styled("none ran", dim())), inner);
+                return;
+            }
+            let rows = rows_in
+                .iter()
+                .map(|t| {
+                    let each = t.a / t.count.max(1);
+                    ShareRow {
+                        name: t.name.clone(),
+                        share: t.a as f64 / waited.max(1) as f64,
+                        color: warn(),
+                        numbers: vec![
+                            compact(t.count),
+                            human_duration((t.a / 1000) as i64),
+                            if each >= 1000 {
+                                format!("{:.1}s", each as f64 / 1000.0)
+                            } else {
+                                format!("{each}ms")
+                            },
+                            compact(t.b / 4),
+                        ],
+                    }
+                })
+                .collect();
+            share_table(frame, inner, &["Hook", "runs", "waited", "each", "added"], rows);
+        }
+        CardKind::Startup => {
+            let rows_in = summary.tally(kind::LISTING);
+            let each: u64 = rows_in.iter().map(|t| t.a / t.count.max(1) / 4).sum();
+            let inner = card_with(
+                frame,
+                area,
+                "Sent at every session start".into(),
+                format!("about {} tokens", compact(each)),
+            );
+            if rows_in.is_empty() {
+                frame.render_widget(Paragraph::new(Span::styled("no session started", dim())), inner);
+                return;
+            }
+            let rows = rows_in
+                .iter()
+                .map(|t| ShareRow {
+                    name: format!("List of {}", t.name),
+                    share: (t.a / t.count.max(1) / 4) as f64 / each.max(1) as f64,
+                    color: accent(),
+                    numbers: vec![
+                        compact(t.b / t.count.max(1)),
+                        compact(t.a / t.count.max(1) / 4),
+                        compact(t.count),
+                    ],
+                })
+                .collect();
+            share_table(frame, inner, &["What", "entries", "tokens", "sessions"], rows);
+        }
+        CardKind::Trouble => {
+            let mut rows_in: Vec<(String, u64)> = Vec::new();
+            for (label, kind) in [
+                ("Hook", kind::HOOK_TROUBLE),
+                ("Refused", kind::DENIED),
+                ("API error", kind::API_ERROR),
+                ("Reply", kind::CUT),
+            ] {
+                rows_in.extend(
+                    summary
+                        .tally(kind)
+                        .iter()
+                        .map(|t| (format!("{label}: {}", t.name), t.count)),
+                );
+            }
+            rows_in.sort_by_key(|row| std::cmp::Reverse(row.1));
+            let total: u64 = rows_in.iter().map(|r| r.1).sum();
+            let inner = card_with(frame, area, "What went wrong".into(), plural(total, "time", "times"));
+            if rows_in.is_empty() {
+                frame.render_widget(Paragraph::new(Span::styled("nothing recorded", dim())), inner);
+                return;
+            }
+            let rows = rows_in
+                .into_iter()
+                .map(|(name, times)| ShareRow {
+                    name,
+                    share: times as f64 / total.max(1) as f64,
+                    color: bad(),
+                    numbers: vec![compact(times)],
+                })
+                .collect();
+            share_table(frame, inner, &["What", "times"], rows);
+        }
+        CardKind::Churn => {
+            let inner = card_with(
+                frame,
+                area,
+                "Files edited over and over".into(),
+                plural(summary.churn.len() as u64, "file", "files"),
+            );
+            if summary.churn.is_empty() {
+                frame.render_widget(Paragraph::new(Span::styled("none", dim())), inner);
+                return;
+            }
+            let most = summary.churn.first().map_or(1, |c| c.1);
+            let rows = summary
+                .churn
+                .iter()
+                .map(|(path, edits)| {
+                    let parts: Vec<&str> = path.rsplit('/').take(2).collect();
+                    ShareRow {
+                        name: parts.into_iter().rev().collect::<Vec<_>>().join("/"),
+                        share: *edits as f64 / most.max(1) as f64,
+                        color: warn(),
+                        numbers: vec![edits.to_string()],
+                    }
+                })
+                .collect();
+            share_table(frame, inner, &["File, in one chat", "edits"], rows);
         }
         CardKind::Days => {
             let inner = card(frame, area, "Output per day · tokens".into());
@@ -2130,15 +2410,34 @@ fn draw_selected(frame: &mut Frame, area: Rect, snapshot: &Snapshot, app: &mut A
         app.hits.push((Rect::new(x, rest.y, width, 1), Hit::Period(today)));
         x += width + 1;
     }
+    x += 2;
+    let page = app.page.min(PAGES.len() - 1);
+    let pages_width: u16 = PAGES.iter().map(|(t, _)| t.len() as u16 + 2).sum::<u16>() + 1;
+    if x + pages_width < rest.x + rest.width {
+        frame.render_widget(
+            Tabs::new(PAGES.iter().map(|(t, _)| *t))
+                .select(page)
+                .style(Style::new().fg(muted()).bg(selected_bg()))
+                .highlight_style(Style::new().fg(Color::Black).bg(violet()).add_modifier(Modifier::BOLD))
+                .divider(" ")
+                .padding(" ", " "),
+            Rect::new(x, rest.y, pages_width, 1),
+        );
+        for (index, (label, _)) in PAGES.iter().enumerate() {
+            let width = label.len() as u16 + 2;
+            app.hits.push((Rect::new(x, rest.y, width, 1), Hit::Page(index)));
+            x += width + 1;
+        }
+    }
     frame.render_widget(
         Paragraph::new(Span::styled(
             format!(
-                "  showing {} · from Claude Code's records on this Mac · p switches",
-                if today_only { "today" } else { "the last 7 days" }
+                "  {} · this Mac's records · p period · v page",
+                if today_only { "today" } else { "last 7 days" }
             ),
             dim(),
         )),
-        Rect::new(x, rest.y, rest.width.saturating_sub(x - rest.x), 1),
+        Rect::new(x, rest.y, (rest.x + rest.width).saturating_sub(x), 1),
     );
     let body = Rect::new(rest.x, rest.y + 1, rest.width, rest.height - 1);
     let message = |frame: &mut Frame, text: String| {
@@ -2165,18 +2464,29 @@ fn draw_selected(frame: &mut Frame, area: Rect, snapshot: &Snapshot, app: &mut A
         return;
     }
     // Cards in order of importance, as many rows of them as fit.
-    let kinds = [
-        CardKind::Models,
-        CardKind::Who,
-        CardKind::Cache,
-        CardKind::Waste,
-        CardKind::Projects,
-        CardKind::Days,
-        CardKind::Hooks,
-        CardKind::Limits,
-        CardKind::Tools,
-        CardKind::Skills,
-    ];
+    let kinds = PAGES[app.page.min(PAGES.len() - 1)].1;
+    // The largest losses, in words, above the cards.
+    let found = findings(&summary);
+    let body = if !found.is_empty() && body.height >= 16 {
+        let mut spans = Vec::new();
+        for (label, what) in found {
+            if !spans.is_empty() {
+                spans.push(Span::styled("   │   ", Style::new().fg(faint())));
+            }
+            spans.push(Span::styled(
+                format!("▸ {label}: "),
+                Style::new().fg(warn()).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(what));
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(body.x, body.y, body.width, 1),
+        );
+        Rect::new(body.x, body.y + 1, body.width, body.height - 1)
+    } else {
+        body
+    };
     let columns = match body.width {
         w if w >= 190 => 4,
         w if w >= 140 => 3,
@@ -2581,6 +2891,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("a", "automatic"),
             ("l", "sign in"),
             ("p", "today / 7 days"),
+            ("v", "usage / waste"),
             ("Tab", "API keys"),
             ("S", "settings"),
             ("?", "all keys"),
@@ -3163,6 +3474,7 @@ fn main_key(app: &mut App, code: KeyCode, jobs: &Sender<Job>) -> Flow {
             let _ = jobs.send(Job::SwitchBest);
         }
         KeyCode::Char('p') => app.today_only = !app.today_only,
+        KeyCode::Char('v') => app.page = (app.page + 1) % PAGES.len(),
         KeyCode::Char('n') => return Flow::SignIn { again: false },
         KeyCode::Char('c') => return Flow::TakeOver,
         _ => {
@@ -3231,6 +3543,7 @@ fn click(app: &mut App, hit: Hit, jobs: &Sender<Job>) -> Flow {
             app.open_editor(key, jobs);
         }
         Hit::Period(today) => app.today_only = today,
+        Hit::Page(page) => app.page = page,
         Hit::Up => {
             modal_key(app, KeyCode::Up, jobs);
         }
@@ -3608,19 +3921,14 @@ mod tests {
             "pinned: /work/studio",
             // What used it, from the transcripts.
             "WHAT USED THIS ACCOUNT",
-            "showing the last 7 days",
+            "last 7 days · this Mac's records",
             "Which model",
             "Fable 5.2",
             "Haiku 5.5",
             "Main chat",
             "Explore",
             "work/studio",
-            "Reused from cache",
-            "Wasted work",
-            "You pressed Escape",
-            "60% reused",
-            "PreToolUse",
-            "Hooks · 1m waiting",
+            "Thinking, by effort",
             "Output per day",
             "today",
             "Limits over time",
@@ -3670,7 +3978,23 @@ mod tests {
     fn the_breakdown_can_show_today_alone_and_says_when_there_is_nothing() {
         let mut app = app();
         app.today_only = true;
-        assert!(render(&mut app, 200, 60).contains("showing today"));
+        assert!(render(&mut app, 200, 60).contains("today · this Mac's records"));
+        // The second page of cards: what was lost.
+        app.page = 1;
+        let screen = render(&mut app, 200, 60);
+        for text in [
+            "Wasted work",
+            "You pressed Escape",
+            "Why the cache was rebuilt",
+            "What tools put in the chat",
+            "Reused from cache",
+            "60% reused",
+            "Hooks",
+        ] {
+            assert!(screen.contains(text), "missing {text:?}");
+        }
+        assert!(!screen.contains("Which model"));
+        app.page = 0;
         app.selected = Some(3);
         let screen = render(&mut app, 200, 60);
         assert!(
@@ -3915,7 +4239,7 @@ mod tests {
         // Two columns and room for two rows: the four most important cards.
         let screen = render(&mut app, 120, 50);
         println!("{screen}");
-        for text in ["Which model", "Who asked", "Cache", "Wasted work"] {
+        for text in ["Which model", "Who asked", "Which project", "Output per day"] {
             assert!(screen.contains(text), "missing {text:?}");
         }
         assert_eq!(

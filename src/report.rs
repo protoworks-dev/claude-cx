@@ -9,7 +9,7 @@
 //! It works with no account added to cx at all: the transcripts name the
 //! accounts they ran on, and those are reported by a number.
 
-use crate::activity::{self, Activity, Summary, Tokens, Waste};
+use crate::activity::{self, Activity, Summary, Tally, Tokens, Waste, kind};
 use crate::hook;
 use crate::store::{Account, Kind, State};
 use serde_json::{Value, json};
@@ -82,6 +82,22 @@ fn brief_waste(w: &Waste) -> Value {
     })
 }
 
+fn rows(s: &Summary, kind: &str, row: impl Fn(&Tally) -> Value) -> Vec<Value> {
+    s.tally(kind).iter().take(TOP).map(row).collect()
+}
+
+fn attributed(t: &Tally) -> Value {
+    json!({"name": t.name, "replies": t.count, "output": t.a, "conversation_tokens_sent": t.b})
+}
+
+fn turns(s: &Summary) -> Value {
+    let (count, ms) = s
+        .tally(kind::TURNS)
+        .iter()
+        .fold((0, 0), |sum, t| (sum.0 + t.count, sum.1 + t.a));
+    json!({"finished": count, "minutes_claude_worked": ms / 60_000, "seconds_each": ms / 1000 / count.max(1)})
+}
+
 fn summary(s: &Summary) -> Value {
     let total = s.total.weight();
     json!({
@@ -98,6 +114,33 @@ fn summary(s: &Summary) -> Value {
             "ms_each": if *runs > 0 { ms / runs } else { 0 },
         })).collect::<Vec<_>>(),
         "waste": waste(&s.waste),
+        "average_conversation_tokens_sent_per_request": (s.total.input + s.total.cache_write + s.total.cache_read) / s.total.requests.max(1),
+        "thinking_by_effort": rows(s, kind::EFFORT, |t| json!({
+            "effort": t.name, "replies": t.count, "output": t.a, "of_which_thinking": t.b,
+            "thinking_pct": (t.b as f64 / t.a.max(1) as f64 * 100.0).round(),
+        })),
+        "cache_writes_by_lifetime": rows(s, kind::CACHE_LIFE, |t| json!({"lifetime": t.name, "replies": t.count, "tokens_written": t.a})),
+        "summarised_while_idle_before_the_cache_expired": s.tally(kind::IDLE_SUMMARY).iter().map(|t| t.count).sum::<u64>(),
+        "turns": turns(s),
+        "tool_output_put_into_conversations": rows(s, kind::TOOL_OUTPUT, |t| json!({
+            "tool": t.name, "results": t.count, "characters": t.a, "about_tokens": t.a / 4,
+            "characters_each": t.a / t.count.max(1), "errors": t.b,
+        })),
+        "hooks_by_command": rows(s, kind::HOOK, |t| json!({
+            "hook": t.name, "runs": t.count, "seconds_waited": t.a / 1000, "ms_each": t.a / t.count.max(1),
+            "characters_added_to_conversations": t.b, "characters_added_each_run": t.b / t.count.max(1),
+        })),
+        "hooks_that_blocked_or_were_cancelled": rows(s, kind::HOOK_TROUBLE, |t| json!({"what": t.name, "times": t.count})),
+        "tool_calls_refused": rows(s, kind::DENIED, |t| json!({"by_and_tool": t.name, "times": t.count})),
+        "work_done_under_a_skill": rows(s, kind::SKILL, attributed),
+        "work_done_under_a_plugin": rows(s, kind::PLUGIN, attributed),
+        "work_done_through_an_mcp_server": rows(s, kind::MCP, attributed),
+        "api_errors": rows(s, kind::API_ERROR, |t| json!({"error": t.name, "times": t.count})),
+        "replies_cut_short": rows(s, kind::CUT, |t| json!({"why": t.name, "times": t.count})),
+        "sent_at_the_start_of_every_session": rows(s, kind::LISTING, |t| json!({
+            "list": t.name, "sessions": t.count, "characters_each": t.a / t.count.max(1),
+            "about_tokens_each": t.a / t.count.max(1) / 4, "entries_each": t.b / t.count.max(1),
+        })),
         "waste_by_project": s.waste_by_project.iter().take(TOP).map(|(project, w)| {
             let mut row = brief_waste(w);
             row["project"] = json!(project);
