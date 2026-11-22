@@ -44,6 +44,7 @@ Out of scope:
 ## How credentials are handled
 
 - Logins and keys are in the macOS Keychain (service `cx-accounts`), or in owner-only files (mode 0600) when `CX_SECRETS=file` or the platform has no Keychain.
+- A credential is passed to the macOS `security` tool on its standard input only, never on a command line. One too long for that (about 2 KB) is kept in an owner-only file instead of the Keychain.
 - `state.json` holds no secret. A token is identified in it by a truncated SHA-256 fingerprint.
 - Transcripts under `~/.claude` are only read. cx keeps sums from them, never message text.
 - Network calls go only to `api.anthropic.com` and `platform.claude.com`, over TLS.

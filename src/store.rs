@@ -365,6 +365,16 @@ pub const SETTING_HELP: [(&str, &str); 11] = [
     ),
 ];
 
+/// Is this a single file or directory name: not empty, not `.` or `..`,
+/// and with no path separator in it?
+pub fn plain_name(name: &str) -> bool {
+    let mut parts = std::path::Path::new(name).components();
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(only)), None) if only == std::ffi::OsStr::new(name)
+    ) && !name.contains(['/', '\\', '\0'])
+}
+
 fn show_value(v: &Value) -> String {
     match v {
         Value::Array(items) => items.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(","),
@@ -386,6 +396,25 @@ impl Settings {
     /// keys compare equal, so an unknown key also returns true.
     pub fn is_default(&self, key: &str) -> bool {
         Settings::default().show(key) == self.show(key)
+    }
+
+    /// Check every value, whatever its source: typed by the user, read from
+    /// an import file, or loaded from disk.
+    pub fn validate(&self) -> Result<()> {
+        for (key, _) in SETTING_HELP {
+            if let Some((_, low, high)) = Settings::number_range(key)
+                && let Some(number) = self.show(key).and_then(|v| v.parse::<f64>().ok())
+                && !(low..=high).contains(&number)
+            {
+                bail!("{key} must be between {low} and {high}");
+            }
+        }
+        // A shared entry becomes a symlink inside a profile directory, so it
+        // must name something directly inside `~/.claude` and nothing else.
+        if let Some(bad) = self.share.iter().find(|name| !plain_name(name)) {
+            bail!("share entry '{bad}' must be a plain file or directory name, without a path");
+        }
+        Ok(())
     }
 
     /// Set one setting from text, checking it.
@@ -426,30 +455,7 @@ impl Settings {
         settings[key] = parsed;
         let settings: Settings =
             serde_json::from_value(settings).with_context(|| format!("'{value}' is not valid for {key}"))?;
-        for (name, line) in [
-            ("threshold_5h", settings.threshold_5h),
-            ("threshold_7d", settings.threshold_7d),
-        ] {
-            if !(50.0..=100.0).contains(&line) {
-                bail!("{name} must be between 50 and 100");
-            }
-        }
-        if !(0.0..=50.0).contains(&settings.margin) {
-            bail!("margin must be between 0 and 50");
-        }
-        if settings.usage_ttl_s < 30 {
-            bail!("usage_ttl_s must be at least 30, to stay inside the usage endpoint's rate limit");
-        }
-        if settings.interval_s < 15 {
-            bail!("interval_s must be at least 15");
-        }
-        // The same bounds the dashboard's editor steps within.
-        if let Some((_, low, high)) = Settings::number_range(key)
-            && let Some(number) = settings.show(key).and_then(|v| v.parse::<f64>().ok())
-            && !(low..=high).contains(&number)
-        {
-            bail!("{key} must be between {low} and {high}");
-        }
+        settings.validate()?;
         *self = settings;
         Ok(())
     }
@@ -794,6 +800,17 @@ mod tests {
         assert!(s.set("nope", "1").is_err());
         assert!(s.set("notify", "maybe").is_err());
         assert!(s.set("cooldown_s", "99999999").is_err());
+        for bad in ["../../.ssh", "/etc", "a/b", "..", ".", "skills,../x"] {
+            assert!(s.set("share", bad).is_err(), "{bad:?} was accepted");
+        }
+        s.set("share", "settings.json,skills").unwrap();
+        assert_eq!(s.share, vec!["settings.json", "skills"]);
+        assert!(plain_name("history.jsonl") && !plain_name("") && !plain_name("a\\b"));
+        let mut crafted = Settings::default();
+        crafted.share.push("../outside".into());
+        crafted.threshold_5h = 5.0;
+        assert!(crafted.validate().is_err());
+        assert!(Settings::default().validate().is_ok());
         assert!(s.set("interval_s", "999999").is_err());
         assert_eq!(s.show("share").unwrap().split(',').next(), Some("settings.json"));
         for (key, _) in SETTING_HELP {

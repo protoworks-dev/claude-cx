@@ -4,6 +4,11 @@ All notable changes are recorded here. The format follows [Keep a Changelog](htt
 
 ## Unreleased
 
+### Security
+
+- Shared entries must be plain names. An import file or a hand-edited state file can no longer make a profile link to, or create a link at, a path outside `~/.claude` and the profile.
+- A credential too long for the `security` tool's standard input is no longer passed on its command line, where other users could read it from the process list. It is kept in an owner-only file instead.
+
 ## 0.4.0 - 2026-11-22
 
 First public release.

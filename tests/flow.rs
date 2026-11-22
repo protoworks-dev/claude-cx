@@ -906,6 +906,21 @@ fn an_export_restores_every_account_on_another_machine() {
     // Settings stay as they were unless asked for.
     assert_eq!(second.ok(&["config", "threshold_5h"]).out.trim(), "90");
 
+    // A share entry with a path in it is refused, typed or stored.
+    assert_ne!(second.cx(&["config", "share", "skills,../../outside"]).code, 0);
+    let state_file = second.home.join(".cx/state.json");
+    let mut crafted = read(&state_file);
+    crafted["settings"]["share"] = json!(["../escape", "skills"]);
+    write(&state_file, &crafted);
+    second.install_fake_claude();
+    std::fs::create_dir_all(second.home.join(".claude/skills")).unwrap();
+    let ran = second.ok(&["run", "1"]);
+    assert!(ran.err.contains("ignoring share entry '../escape'"), "{}", ran.err);
+    assert!(!second.home.join(".cx/profiles/escape").exists());
+    assert!(second.home.join(".cx/profiles/1/skills").exists());
+    crafted["settings"]["share"] = json!(["skills"]);
+    write(&state_file, &crafted);
+
     // A second import changes nothing; --settings brings the settings.
     let again = second.cx_with(
         &["import", path, "--settings"],

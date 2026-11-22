@@ -1,5 +1,7 @@
 //! Secret storage: the macOS Keychain through `/usr/bin/security`, or
 //! owner-only files when `CX_SECRETS=file` or the platform has no Keychain.
+//! A value never goes on a command line: one too long for `security`'s
+//! stdin is kept in an owner-only file instead.
 //!
 //! The Keychain is driven through Apple's `security` tool and not through
 //! Security.framework. An item's access list names the program that created
@@ -84,31 +86,43 @@ pub fn keychain_get(service: &str, account: &str) -> Result<Option<String>> {
     }
 }
 
-/// Create the Keychain item for `service` and `account`, or replace its
-/// value, by running `security`. The value is passed on stdin when the
-/// command fits `security`'s line buffer. A longer one goes on the command
-/// line, hex-encoded, where other processes of the same user can see it
-/// while `security` runs. Fails on a non-zero exit or after 8 seconds.
-pub fn keychain_set(service: &str, account: &str, value: &str) -> Result<()> {
+/// What [`keychain_set`] did with a value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Written {
+    /// The item now holds the value.
+    Stored,
+    /// The value is too long to hand to `security` on stdin. Nothing was
+    /// written; the caller must keep it somewhere else.
+    TooLarge,
+}
+
+/// The one line `security -i` is given to store a value, or `None` when the
+/// line would not fit its buffer.
+fn store_line(service: &str, account: &str, value: &str) -> Option<String> {
     let hex: String = value.bytes().map(|b| format!("{b:02x}")).collect();
-    // The value goes through stdin so it never shows in the process list. A
-    // command longer than the line buffer would be cut mid-argument, so only
-    // then does it go on the command line, still hex-encoded.
     let line = format!(
         "add-generic-password -U -a {} -s {} -X {}\n",
         quote(account),
         quote(service),
         hex
     );
-    let out = if line.len() <= STDIN_LINE_LIMIT {
-        run_bounded(Command::new(SECURITY).arg("-i"), Some(&line), TIMEOUT)?
-    } else {
-        run_bounded(
-            Command::new(SECURITY).args(["add-generic-password", "-U", "-a", account, "-s", service, "-X", &hex]),
-            None,
-            TIMEOUT,
-        )?
+    (line.len() <= STDIN_LINE_LIMIT).then_some(line)
+}
+
+/// Create the Keychain item for `service` and `account`, or replace its
+/// value, by running `security`.
+///
+/// The value only ever travels on `security`'s stdin, never on its command
+/// line, where every user of the machine could read it from the process
+/// list. `security -i` reads a command into a fixed buffer, so a value that
+/// does not fit is not written at all: the answer is [`Written::TooLarge`]
+/// and the caller stores it in an owner-only file instead. Fails on a
+/// non-zero exit or after 8 seconds.
+pub fn keychain_set(service: &str, account: &str, value: &str) -> Result<Written> {
+    let Some(line) = store_line(service, account, value) else {
+        return Ok(Written::TooLarge);
     };
+    let out = run_bounded(Command::new(SECURITY).arg("-i"), Some(&line), TIMEOUT)?;
     if out.code != 0 {
         bail!(
             "Keychain write of '{service}' failed (exit {}): {}",
@@ -116,7 +130,7 @@ pub fn keychain_set(service: &str, account: &str, value: &str) -> Result<()> {
             out.stderr.trim()
         );
     }
-    Ok(())
+    Ok(Written::Stored)
 }
 
 /// Delete the Keychain item for `service` and `account` by running
@@ -143,46 +157,71 @@ fn secret_file(name: &str) -> PathBuf {
     util::store_root().join("secrets").join(format!("{name}.secret"))
 }
 
-/// Read one of cx's own secrets from the current [`backend`]: the Keychain
-/// item under [`SERVICE`], or the file `secrets/<name>.secret`. `Ok(None)`
-/// when it was never stored. The returned value is secret and must not be
-/// logged.
+fn read_file(name: &str) -> Result<Option<String>> {
+    match std::fs::read_to_string(secret_file(name)) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).context("read secret file"),
+    }
+}
+
+fn write_file(name: &str, value: &str) -> Result<()> {
+    let path = secret_file(name);
+    util::mkdir_private(path.parent().context("secret path has no parent")?)?;
+    util::atomic_write(&path, value.as_bytes(), 0o600)
+}
+
+fn delete_file(name: &str) -> Result<()> {
+    match std::fs::remove_file(secret_file(name)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).context("delete secret file"),
+    }
+}
+
+/// Read one of cx's own secrets: the Keychain item under [`SERVICE`], or
+/// the owner-only file `secrets/<name>.secret`. With the Keychain backend
+/// the file is looked at when there is no item, because a value too long
+/// for the Keychain write is kept there (see [`set`]). `Ok(None)` when it
+/// was never stored. The returned value is secret and must not be logged.
 pub fn get(name: &str) -> Result<Option<String>> {
     match backend() {
-        Backend::Keychain => keychain_get(SERVICE, name),
-        Backend::File => match std::fs::read_to_string(secret_file(name)) {
-            Ok(text) => Ok(Some(text)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).context("read secret file"),
+        Backend::Keychain => match keychain_get(SERVICE, name)? {
+            Some(text) => Ok(Some(text)),
+            None => read_file(name),
         },
+        Backend::File => read_file(name),
     }
 }
 
-/// Store one of cx's own secrets in the current [`backend`], replacing any
-/// earlier value. The file backend writes the file atomically with mode
-/// 0600 and creates its directory as private.
+/// Store one of cx's own secrets, replacing any earlier value, and leave
+/// exactly one copy of it.
+///
+/// With the Keychain backend a value that fits goes to the Keychain. One
+/// that is too long to pass safely (see [`keychain_set`]) goes to the
+/// owner-only file instead, and the Keychain item is removed so an older
+/// value cannot be read in its place. Files are written atomically with
+/// mode 0600 in a private directory.
 pub fn set(name: &str, value: &str) -> Result<()> {
     match backend() {
-        Backend::Keychain => keychain_set(SERVICE, name, value),
-        Backend::File => {
-            let path = secret_file(name);
-            util::mkdir_private(path.parent().unwrap())?;
-            util::atomic_write(&path, value.as_bytes(), 0o600)
-        }
+        Backend::Keychain => match keychain_set(SERVICE, name, value)? {
+            Written::Stored => delete_file(name),
+            Written::TooLarge => {
+                write_file(name, value)?;
+                keychain_delete(SERVICE, name)
+            }
+        },
+        Backend::File => write_file(name, value),
     }
 }
 
-/// Remove one of cx's own secrets from the current [`backend`]. Succeeds
-/// when it was already gone.
+/// Remove one of cx's own secrets from wherever it is kept. Succeeds when
+/// it was already gone.
 pub fn delete(name: &str) -> Result<()> {
-    match backend() {
-        Backend::Keychain => keychain_delete(SERVICE, name),
-        Backend::File => match std::fs::remove_file(secret_file(name)) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e).context("delete secret file"),
-        },
+    if backend() == Backend::Keychain {
+        keychain_delete(SERVICE, name)?;
     }
+    delete_file(name)
 }
 
 #[cfg(test)]
@@ -202,12 +241,29 @@ mod tests {
             "a".repeat(900),
             "y".repeat(2500)
         );
-        for value in [&small, &big, &small] {
-            keychain_set(service, &user, value).unwrap();
+        for value in [&small, &small] {
+            assert_eq!(keychain_set(service, &user, value).unwrap(), Written::Stored);
             assert_eq!(keychain_get(service, &user).unwrap().as_deref(), Some(value.as_str()));
         }
+        // Too long for stdin: refused, and the item is left as it was.
+        assert_eq!(keychain_set(service, &user, &big).unwrap(), Written::TooLarge);
+        assert_eq!(keychain_get(service, &user).unwrap().as_deref(), Some(small.as_str()));
         keychain_delete(service, &user).unwrap();
         assert_eq!(keychain_get(service, &user).unwrap(), None);
         keychain_delete(service, &user).unwrap();
+    }
+
+    #[test]
+    fn a_value_only_ever_goes_to_security_on_stdin() {
+        let line = store_line("svc", "me", "ab").unwrap();
+        assert_eq!(line, "add-generic-password -U -a \"me\" -s \"svc\" -X 6162\n");
+        // One byte under the buffer fits; a long value is refused, not
+        // passed some other way.
+        assert!(store_line("svc", "me", &"x".repeat(1900)).is_some());
+        assert!(store_line("svc", "me", &"x".repeat(2100)).is_none());
+        // The only way this module starts `security` with a value is `-i`.
+        let source = include_str!("secrets.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        assert!(!code.contains("\"-X\""), "a value is being put on a command line");
     }
 }

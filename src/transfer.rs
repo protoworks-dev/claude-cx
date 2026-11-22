@@ -112,6 +112,14 @@ pub fn import(engine: &Engine, sealed: &[u8], passphrase: &str, with_settings: b
             bundle.cx_export
         );
     }
+    // The file is someone's input: its settings are checked like typed ones
+    // before anything is changed.
+    if with_settings {
+        bundle
+            .settings
+            .validate()
+            .context("the file's settings are not valid")?;
+    }
     let _operation = engine.store.lock_operations()?;
     let mut report = Vec::new();
     // Old number -> new number, for the directory pins.

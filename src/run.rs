@@ -45,6 +45,12 @@ fn link_shared(profile: &Path, share: &[String]) -> Result<()> {
         }
     }
     for name in share {
+        // Only a plain name may become a link: anything with a path in it
+        // would point, or be created, outside the two directories.
+        if !crate::store::plain_name(name) {
+            ui::note(&format!("cx: ignoring share entry '{name}': it is not a plain name"));
+            continue;
+        }
         let source = source_root.join(name);
         let dest = profile.join(name);
         if !source.exists() {

@@ -184,9 +184,22 @@ impl ClaudeHome {
             // Code creates it from the plaintext file on its first write.
             if self.default || existing.is_some() {
                 let merged = cred::merge_login(existing.as_deref(), oauth);
-                secrets::keychain_set(&self.keychain_service(), &secrets::keychain_user(), &merged)?;
-                if file_text.is_none() {
-                    return Ok(());
+                let (service, user) = (self.keychain_service(), secrets::keychain_user());
+                match secrets::keychain_set(&service, &user, &merged)? {
+                    secrets::Written::Stored => {
+                        if file_text.is_none() {
+                            return Ok(());
+                        }
+                    }
+                    // Too long to hand to `security` without showing it in
+                    // the process list. The whole object goes to the
+                    // owner-only file, which Claude Code also reads, and
+                    // the item is removed so its older login cannot win.
+                    secrets::Written::TooLarge => {
+                        util::mkdir_private(&self.dir)?;
+                        util::atomic_write(&file, merged.as_bytes(), 0o600)?;
+                        return secrets::keychain_delete(&service, &user);
+                    }
                 }
             }
         }
