@@ -22,6 +22,8 @@
 //! | [`rank`] | Which account is best, and when to switch |
 //! | [`history`] | Usage readings over time, and forecasts from them |
 //! | [`activity`] | What each account was used for, from Claude Code's transcripts |
+//! | [`report`] | Everything cx knows as JSON, for the Claude Code plugin |
+//! | [`hook`] | What Claude Code's hooks tell cx during a session |
 //! | [`run`] | Starting Claude Code on one account in one terminal |
 //! | [`accounts`] | Adding accounts: sign-in, API keys, import from claude-swap |
 //! | [`transfer`] | Encrypted export and import |
@@ -46,11 +48,13 @@ pub mod claude;
 pub mod cred;
 pub mod engine;
 pub mod history;
+pub mod hook;
 pub mod lock;
 #[cfg(target_os = "macos")]
 pub mod menubar;
 pub mod notify;
 pub mod rank;
+pub mod report;
 pub mod run;
 pub mod secrets;
 pub mod service;

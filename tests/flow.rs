@@ -1023,3 +1023,82 @@ fn auto_notifies_when_it_switches() {
     assert!(text.starts_with("cx: Now on #2 B"), "{text:?}");
     assert_eq!(world.live_access(), "at:B:1");
 }
+
+#[test]
+fn hooks_are_recorded_and_the_report_counts_stops_without_any_account() {
+    use std::io::Write;
+    // No account added to cx: the plugin must still have something to read.
+    let world = World::new();
+    let project = world.home.join(".claude/projects/-work-app");
+    std::fs::create_dir_all(&project).unwrap();
+    let stamp = chrono::Utc::now().to_rfc3339();
+    let transcript = project.join("s1.jsonl");
+    let lines = [
+        json!({"type": "session-owner", "accountUuid": "acct-x"}),
+        json!({"type": "user", "timestamp": stamp, "cwd": "/work/app", "message": {"content": "build the thing"}}),
+        json!({"type": "assistant", "timestamp": stamp, "cwd": "/work/app", "requestId": "r1",
+            "message": {"model": "claude-fable-5-2", "content": [{"type": "text", "text": "working"}],
+                "usage": {"input_tokens": 5, "output_tokens": 900, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}}),
+        json!({"type": "user", "timestamp": stamp, "cwd": "/work/app", "message": {"content": "[Request interrupted by user]"}}),
+        json!({"type": "user", "timestamp": stamp, "cwd": "/work/app", "message": {"content": "use the other file"}}),
+    ];
+    let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    std::fs::write(&transcript, text).unwrap();
+
+    let hook = |input: Value| {
+        let mut child = world
+            .command(&["hook"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert_eq!(
+        hook(json!({"hook_event_name": "SessionStart", "session_id": "s1", "cwd": "/work/app", "source": "startup"})),
+        ""
+    );
+    assert_eq!(
+        hook(
+            json!({"hook_event_name": "PostToolUseFailure", "session_id": "s1", "tool_name": "Bash",
+            "tool_input": {"command": "a-secret-command"}})
+        ),
+        ""
+    );
+    // Input that is not JSON must not fail the session either.
+    let mut bad = world.command(&["hook"]);
+    bad.stdin(std::process::Stdio::null());
+    assert_eq!(world.finish(&mut bad).code, 0);
+    let events = std::fs::read_to_string(world.home.join(".cx/events.jsonl")).unwrap();
+    assert_eq!(events.lines().count(), 2);
+    assert!(!events.contains("a-secret-command"));
+
+    let report: Value = serde_json::from_str(&world.ok(&["report"]).out).unwrap();
+    assert_eq!(report["accounts"][0]["name"], "account 1 (not added to cx)");
+    let waste = &report["all_accounts_together"]["waste"];
+    assert_eq!(waste["stopped_while_replying"], 1);
+    assert_eq!(waste["output_tokens_in_stopped_turns"], 900);
+    assert_eq!(waste["prompts_right_after_a_stop"], 1);
+    assert_eq!(
+        report["from_the_plugin_hooks"]["sessions_open_now"][0]["project"],
+        "work/app"
+    );
+    assert_eq!(report["from_the_plugin_hooks"]["tool_failures"][0]["name"], "Bash");
+    assert_eq!(
+        report["most_wasteful_conversations"][0]["transcript"],
+        json!(transcript)
+    );
+
+    let moments: Value =
+        serde_json::from_str(&world.ok(&["report", "--moments", transcript.to_str().unwrap()]).out).unwrap();
+    assert_eq!(moments["moments"][0]["asked"], "build the thing");
+    assert_eq!(moments["moments"][0]["then"], "use the other file");
+}

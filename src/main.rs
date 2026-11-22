@@ -169,6 +169,20 @@ enum Cmd {
     },
     /// Check the setup and report anything wrong
     Doctor,
+    /// Print usage and waste as JSON, for the Claude Code plugin and other tools
+    Report {
+        /// How many days back to look (1 is today)
+        #[arg(long, default_value_t = 7)]
+        days: i64,
+        /// Show the stops and corrections in one transcript, with the text around them
+        #[arg(long, value_name = "TRANSCRIPT")]
+        moments: Option<std::path::PathBuf>,
+        /// How many moments to show
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Record a Claude Code hook event read from standard input (used by the plugin)
+    Hook,
     /// Read the local transcripts and print each account's totals
     #[command(hide = true)]
     Activity,
@@ -200,6 +214,24 @@ fn main() {
 }
 
 fn dispatch(cli: Cli) -> Result<i32> {
+    // A hook runs inside someone's session: it does the least it can and
+    // never fails.
+    if matches!(cli.command, Some(Cmd::Hook)) {
+        claude_cx::hook::run(&claude_cx::util::store_root());
+        return Ok(0);
+    }
+    if let Some(Cmd::Report {
+        moments: Some(transcript),
+        limit,
+        ..
+    }) = &cli.command
+    {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&claude_cx::report::moments(transcript, *limit))?
+        );
+        return Ok(0);
+    }
     let engine = Engine::open()?;
     match cli.command {
         None => {
@@ -419,6 +451,22 @@ fn dispatch(cli: Cli) -> Result<i32> {
             clap_complete::generate(shell, &mut Cli::command(), "cx", &mut std::io::stdout());
         }
         Some(Cmd::Doctor) => return doctor(&engine),
+        Some(Cmd::Hook) => {}
+        Some(Cmd::Report { days, .. }) => {
+            let mut activity = activity::Activity::load(&engine.store.root);
+            activity.refresh(&claude::ClaudeHome::default_home().dir, &engine.store.root);
+            let state = engine.store.load()?;
+            let live = engine.identify_live(false).ok().and_then(|live| live.account);
+            let report = claude_cx::report::build(
+                &state,
+                live,
+                &activity,
+                &engine.store.root,
+                days,
+                claude_cx::util::now_ms(),
+            );
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
         Some(Cmd::Activity) => {
             let started = std::time::Instant::now();
             let mut activity = activity::Activity::load(&engine.store.root);

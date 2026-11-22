@@ -1691,6 +1691,8 @@ enum CardKind {
     Tools,
     Hooks,
     Limits,
+    Waste,
+    Skills,
 }
 
 /// What the cards draw from.
@@ -1851,17 +1853,20 @@ fn draw_card(frame: &mut Frame, area: Rect, kind: CardKind, b: &Breakdown) {
                 .column_spacing(1),
                 table,
             );
-            let mut lines = vec![if total.rebuilds > 0 {
+            // The first reply of a conversation always writes the cache;
+            // only the rebuilds after that are worth a warning.
+            let (rebuilds, rebuilt) = summary.waste.avoidable_rebuilds();
+            let mut lines = vec![if rebuilds > 0 {
                 Line::from(Span::styled(
                     format!(
-                        "Cache rebuilt {}, {} tokens resent",
-                        plural(total.rebuilds, "time", "times"),
-                        compact(total.rebuilt)
+                        "Cache rebuilt {} mid-chat, {} tokens resent",
+                        plural(rebuilds, "time", "times"),
+                        compact(rebuilt)
                     ),
                     Style::new().fg(warn()),
                 ))
             } else {
-                Line::from(Span::styled("The cache was never rebuilt", dim()))
+                Line::from(Span::styled("No cache rebuilds mid-chat", dim()))
             }];
             if summary.compactions > 0 {
                 lines.push(Line::from(Span::styled(
@@ -1873,6 +1878,96 @@ fn draw_card(frame: &mut Frame, area: Rect, kind: CardKind, b: &Breakdown) {
                 )));
             }
             frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), notes);
+        }
+        CardKind::Waste => {
+            let w = &summary.waste;
+            let inner = card(frame, area, "Wasted work".into());
+            let (rebuilds, rebuilt) = w.avoidable_rebuilds();
+            let line = |label: &str, n: u64, note: String| {
+                Row::new(vec![
+                    Cell::from(label.to_string()),
+                    Cell::from(
+                        Line::from(Span::styled(
+                            compact(n),
+                            if n > 0 {
+                                Style::new().fg(warn()).add_modifier(Modifier::BOLD)
+                            } else {
+                                dim()
+                            },
+                        ))
+                        .right_aligned(),
+                    ),
+                    Cell::from(Span::styled(note, dim())),
+                ])
+            };
+            let rows = [
+                line(
+                    "You pressed Escape",
+                    w.stops + w.tool_stops,
+                    format!("{} tokens written first", compact(w.lost_output)),
+                ),
+                line(
+                    "You corrected it",
+                    w.redirects + w.corrections,
+                    format!("of {}", plural(w.prompts, "prompt", "prompts")),
+                ),
+                line(
+                    "Chat summarised",
+                    w.auto_summaries + w.asked_summaries,
+                    format!("{} waiting", human_duration((w.summary_ms / 1000) as i64)),
+                ),
+                line("Cache rebuilt", rebuilds, format!("{} tokens resent", compact(rebuilt))),
+            ];
+            let [table, notes] = Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).areas(inner);
+            frame.render_widget(
+                Table::new(
+                    rows,
+                    [Constraint::Length(18), Constraint::Length(5), Constraint::Min(0)],
+                )
+                .column_spacing(1),
+                table,
+            );
+            let worst = w
+                .rebuilds
+                .iter()
+                .filter(|(cause, _)| cause.as_str() != activity::cause::START)
+                .max_by_key(|(_, (_, tokens))| *tokens);
+            if let Some((cause, (count, tokens))) = worst {
+                frame.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(Span::styled("Most rebuilds:", dim())),
+                        Line::from(Span::styled(
+                            format!(
+                                "{cause} · {} · {} tokens",
+                                plural(*count, "time", "times"),
+                                compact(*tokens)
+                            ),
+                            Style::new().fg(warn()),
+                        )),
+                    ])
+                    .wrap(Wrap { trim: true }),
+                    notes,
+                );
+            }
+        }
+        CardKind::Skills => {
+            let calls: u64 = summary.skills.iter().map(|s| s.1).sum();
+            let inner = card(frame, area, format!("Skills started · {}", compact(calls)));
+            if summary.skills.is_empty() {
+                frame.render_widget(Paragraph::new(Span::styled("none started", dim())), inner);
+                return;
+            }
+            let rows = summary
+                .skills
+                .iter()
+                .map(|(name, n)| ShareRow {
+                    name: name.clone(),
+                    share: *n as f64 / calls.max(1) as f64,
+                    color: violet(),
+                    numbers: vec![compact(*n)],
+                })
+                .collect();
+            share_table(frame, inner, &["Skill", "times"], rows);
         }
         CardKind::Days => {
             let inner = card(frame, area, "Output per day · tokens".into());
@@ -2074,11 +2169,13 @@ fn draw_selected(frame: &mut Frame, area: Rect, snapshot: &Snapshot, app: &mut A
         CardKind::Models,
         CardKind::Who,
         CardKind::Cache,
-        CardKind::Days,
+        CardKind::Waste,
         CardKind::Projects,
-        CardKind::Tools,
+        CardKind::Days,
         CardKind::Hooks,
         CardKind::Limits,
+        CardKind::Tools,
+        CardKind::Skills,
     ];
     let columns = match body.width {
         w if w >= 190 => 4,
@@ -3518,7 +3615,8 @@ mod tests {
             "Explore",
             "work/studio",
             "Reused from cache",
-            "Cache rebuilt 1 time, 60.0k tokens resent",
+            "Wasted work",
+            "You pressed Escape",
             "60% reused",
             "PreToolUse",
             "Hooks · 1m waiting",
@@ -3816,7 +3914,7 @@ mod tests {
         // Two columns and room for two rows: the four most important cards.
         let screen = render(&mut app, 120, 50);
         println!("{screen}");
-        for text in ["Which model", "Who asked", "Cache", "Output per day"] {
+        for text in ["Which model", "Who asked", "Cache", "Wasted work"] {
             assert!(screen.contains(text), "missing {text:?}");
         }
         assert_eq!(

@@ -10,7 +10,8 @@
 //! The transcripts are large (gigabytes), so a file is read once and then
 //! only from where the last read stopped. The sums per file are kept in
 //! `activity.json` in the cx state directory. Nothing is ever written to
-//! `~/.claude`, and no message text is read into the sums.
+//! `~/.claude`, and no message text is kept: a prompt's first words are
+//! looked at to count corrections, and only the count is stored.
 
 use crate::util;
 use serde::{Deserialize, Serialize};
@@ -19,12 +20,39 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// Bumped when what is kept per file changes, so old sums are read again.
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 4;
 /// Days of activity kept and shown.
 pub const DAYS: i64 = 7;
 /// A reply that wrote this many tokens to the cache while reading fewer
 /// than it wrote had to rebuild the conversation's cache.
 const REBUILD_TOKENS: u64 = 20_000;
+/// A file edited this many times in one conversation is listed as churn.
+pub const CHURN_EDITS: u32 = 8;
+/// The prompt cache is kept for five minutes by default, and for an hour
+/// where the longer lifetime is in use.
+const SHORT_IDLE_MS: i64 = 5 * 60_000;
+const LONG_IDLE_MS: i64 = 60 * 60_000;
+
+/// Why a reply had to write the conversation to the prompt cache again.
+pub mod cause {
+    /// The first reply of a conversation or of a subagent run: there was
+    /// nothing in the cache yet. This one cannot be avoided.
+    pub const START: &str = "start";
+    /// More than an hour passed since the previous reply.
+    pub const LONG_IDLE: &str = "idle over an hour";
+    /// Between five minutes and an hour passed since the previous reply.
+    pub const IDLE: &str = "idle over 5 minutes";
+    /// The conversation had just been summarised.
+    pub const COMPACT: &str = "after a summary";
+    /// The model changed from the previous reply.
+    pub const MODEL: &str = "model changed";
+    /// None of the above: the tools, the system prompt or a memory file
+    /// changed, or the cache was dropped for a reason the transcript does
+    /// not record.
+    pub const OTHER: &str = "something else changed";
+    /// Added to a cause when the rebuild happened inside a subagent run.
+    pub const IN_SUBAGENT: &str = ", in a subagent";
+}
 
 /// Token counts summed over a set of replies, as the transcripts report
 /// them. The short serde names keep `activity.json` small.
@@ -75,6 +103,92 @@ impl Tokens {
     pub fn weight(&self) -> f64 {
         self.input as f64 + self.output as f64 * 5.0 + self.cache_write as f64 * 1.25 + self.cache_read as f64 * 0.1
     }
+}
+
+/// Work that was paid for and then thrown away or repeated: turns the user
+/// stopped, prompts that corrected the previous turn, conversations that
+/// were summarised, and caches that were written again.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Waste {
+    /// Prompts the user typed (commands and tool results are not counted).
+    #[serde(default, rename = "p")]
+    pub prompts: u64,
+    /// Times the user pressed Escape while Claude was writing or thinking.
+    #[serde(default, rename = "s")]
+    pub stops: u64,
+    /// Times the user stopped or refused a tool call.
+    #[serde(default, rename = "ts")]
+    pub tool_stops: u64,
+    /// Tokens Claude had written in the turns that were stopped, from the
+    /// user's prompt up to the stop.
+    #[serde(default, rename = "lo")]
+    pub lost_output: u64,
+    /// Prompts typed straight after a stop: the user steering again.
+    #[serde(default, rename = "rd")]
+    pub redirects: u64,
+    /// Other prompts that open by saying the last turn was wrong ("no,",
+    /// "I said", "still not"). Counted by their wording, so an estimate.
+    #[serde(default, rename = "c")]
+    pub corrections: u64,
+    /// Summaries Claude Code started itself because the conversation was full.
+    #[serde(default, rename = "ac")]
+    pub auto_summaries: u64,
+    /// Summaries the user asked for.
+    #[serde(default, rename = "mc")]
+    pub asked_summaries: u64,
+    /// Tokens in the conversations at the moment they were summarised.
+    #[serde(default, rename = "ct")]
+    pub summarised: u64,
+    /// Time spent writing those summaries, in milliseconds.
+    #[serde(default, rename = "cm")]
+    pub summary_ms: u64,
+    /// Cache rebuilds by [`cause`]: how many, and the tokens written.
+    #[serde(default, rename = "rb", skip_serializing_if = "BTreeMap::is_empty")]
+    pub rebuilds: BTreeMap<String, (u64, u64)>,
+}
+
+impl Waste {
+    /// Add every count of `other` to this one.
+    pub fn add(&mut self, other: &Waste) {
+        self.prompts += other.prompts;
+        self.stops += other.stops;
+        self.tool_stops += other.tool_stops;
+        self.lost_output += other.lost_output;
+        self.redirects += other.redirects;
+        self.corrections += other.corrections;
+        self.auto_summaries += other.auto_summaries;
+        self.asked_summaries += other.asked_summaries;
+        self.summarised += other.summarised;
+        self.summary_ms += other.summary_ms;
+        for (cause, (count, tokens)) in &other.rebuilds {
+            let entry = self.rebuilds.entry(cause.clone()).or_default();
+            entry.0 += count;
+            entry.1 += tokens;
+        }
+    }
+
+    /// Rebuilds that could have been avoided (every cause but the start
+    /// of a conversation): how many, and the tokens written.
+    pub fn avoidable_rebuilds(&self) -> (u64, u64) {
+        self.rebuilds
+            .iter()
+            .filter(|(cause, _)| cause.as_str() != cause::START)
+            .fold((0, 0), |sum, (_, (count, tokens))| (sum.0 + count, sum.1 + tokens))
+    }
+}
+
+/// [`Waste`] for one account, day and project.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WasteRow {
+    /// The local calendar day, as `YYYY-MM-DD`.
+    pub day: String,
+    /// The account uuid the transcript was on, as in [`Row::owner`].
+    pub owner: String,
+    /// The project, as in [`Row::project`].
+    pub project: String,
+    /// The counts for this combination.
+    #[serde(flatten)]
+    pub waste: Waste,
 }
 
 /// Sums for one account, day, model, project and (for a subagent) agent type.
@@ -148,6 +262,23 @@ struct FileSums {
     tools: Vec<ToolRow>,
     #[serde(default)]
     compactions: Vec<(String, String)>,
+    #[serde(default)]
+    waste: Vec<WasteRow>,
+    /// Skill invocations, with the skill's name in `tool`.
+    #[serde(default)]
+    skills: Vec<ToolRow>,
+    /// Edits per file in this conversation: the day of the latest and how many.
+    #[serde(default)]
+    edits: BTreeMap<String, (String, u32)>,
+    /// Tokens written since the user's last prompt.
+    #[serde(default)]
+    turn_output: u64,
+    #[serde(default)]
+    after_summary: bool,
+    #[serde(default)]
+    after_stop: bool,
+    #[serde(default)]
+    last_project: String,
 }
 
 /// The sums for every transcript changed in the last [`DAYS`] days, keyed by
@@ -187,6 +318,109 @@ struct Block {
     kind: String,
     #[serde(default)]
     name: String,
+    #[serde(default)]
+    input: BlockInput,
+}
+
+#[derive(Deserialize, Default)]
+struct BlockInput {
+    #[serde(default)]
+    skill: String,
+    #[serde(default)]
+    file_path: String,
+    #[serde(default)]
+    notebook_path: String,
+}
+
+#[derive(Deserialize, Default)]
+struct UserMessage {
+    #[serde(default)]
+    content: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct UserLine {
+    #[serde(default)]
+    timestamp: String,
+    #[serde(default)]
+    cwd: String,
+    #[serde(rename = "isMeta", default)]
+    is_meta: bool,
+    #[serde(rename = "isCompactSummary", default)]
+    is_summary: bool,
+    #[serde(default)]
+    message: UserMessage,
+}
+
+#[derive(Deserialize, Default)]
+struct CompactJson {
+    #[serde(default)]
+    trigger: String,
+    #[serde(rename = "preTokens", default)]
+    pre_tokens: u64,
+    #[serde(rename = "durationMs", default)]
+    duration_ms: f64,
+}
+
+#[derive(Deserialize)]
+struct CompactLine {
+    #[serde(default)]
+    timestamp: String,
+    #[serde(default)]
+    cwd: String,
+    #[serde(rename = "compactMetadata", default)]
+    meta: CompactJson,
+}
+
+/// Whether a prompt opens by saying the previous turn was wrong. Only the
+/// first words are looked at, and nothing of the prompt is kept.
+fn reads_as_correction(text: &str) -> bool {
+    let head: String = text.trim_start().chars().take(160).collect::<String>().to_lowercase();
+    const OPENS: [&str; 14] = [
+        "no,",
+        "no ",
+        "no.",
+        "nope",
+        "stop",
+        "wrong",
+        "that's not",
+        "thats not",
+        "not what",
+        "i said",
+        "i told",
+        "undo",
+        "revert",
+        "again,",
+    ];
+    const HOLDS: [&str; 12] = [
+        "i said",
+        "i told you",
+        "not what i",
+        "you didn't",
+        "you didnt",
+        "you did not",
+        "why did you",
+        "still not",
+        "still broken",
+        "didn't work",
+        "doesn't work",
+        "i asked",
+    ];
+    OPENS.iter().any(|w| head.starts_with(w)) || HOLDS.iter().any(|w| head.contains(w))
+}
+
+/// The text of a user message, whether it is a plain string or a list of
+/// blocks. `None` when it carries no text (a tool result, an image alone).
+fn prompt_text(content: &serde_json::Value) -> Option<&str> {
+    match content {
+        serde_json::Value::String(text) => Some(text),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .find(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .and_then(|b| b.get("text"))
+            .and_then(|t| t.as_str()),
+        _ => None,
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -227,12 +461,6 @@ struct HookLine {
     timestamp: String,
     #[serde(default)]
     attachment: HookJson,
-}
-
-#[derive(Deserialize)]
-struct StampLine {
-    #[serde(default)]
-    timestamp: String,
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> bool {
@@ -292,6 +520,8 @@ struct Pending {
     rows: HashMap<(String, String, String, String, String), Tokens>,
     hooks: HashMap<(String, String, String), (u64, u64)>,
     tools: HashMap<(String, String, String), u64>,
+    skills: HashMap<(String, String, String), u64>,
+    waste: HashMap<(String, String, String), Waste>,
 }
 
 impl FileSums {
@@ -311,6 +541,8 @@ impl FileSums {
             rows: HashMap::new(),
             hooks: HashMap::new(),
             tools: HashMap::new(),
+            skills: HashMap::new(),
+            waste: HashMap::new(),
         };
         let mut seen: HashSet<String> = HashSet::new();
         seen.insert(self.last_request.clone());
@@ -346,12 +578,29 @@ impl FileSums {
                     entry.0 += 1;
                     entry.1 += hook.attachment.duration_ms.max(0.0) as u64;
                 }
-            } else if find(&line, b"\"subtype\":\"compact_boundary\"")
-                && let Ok(stamp) = serde_json::from_slice::<StampLine>(&line)
-                && let Some((day, _)) = day_of(&stamp.timestamp)
-                && day.as_str() >= oldest_day
+            } else if find(&line, b"\"subtype\":\"compact_boundary\"") {
+                if let Ok(compact) = serde_json::from_slice::<CompactLine>(&line)
+                    && let Some((day, _)) = day_of(&compact.timestamp)
+                {
+                    self.after_summary = true;
+                    if day.as_str() >= oldest_day {
+                        self.compactions.push((day.clone(), self.owner.clone()));
+                        let project = self.project_for(&compact.cwd);
+                        let waste = pending.waste.entry((day, self.owner.clone(), project)).or_default();
+                        if compact.meta.trigger == "manual" {
+                            waste.asked_summaries += 1;
+                        } else {
+                            waste.auto_summaries += 1;
+                        }
+                        waste.summarised += compact.meta.pre_tokens;
+                        waste.summary_ms += compact.meta.duration_ms.max(0.0) as u64;
+                    }
+                }
+            } else if agent_type.is_empty()
+                && find(&line, b"\"type\":\"user\"")
+                && !find(&line, b"\"type\":\"tool_result\"")
             {
-                self.compactions.push((day, self.owner.clone()));
+                self.prompt(&line, oldest_day, &mut pending);
             }
         }
         self.size = size;
@@ -389,6 +638,36 @@ impl FileSums {
                 }),
             }
         }
+        for ((day, owner, project), waste) in pending.waste {
+            match self
+                .waste
+                .iter_mut()
+                .find(|w| w.day == day && w.owner == owner && w.project == project)
+            {
+                Some(row) => row.waste.add(&waste),
+                None => self.waste.push(WasteRow {
+                    day,
+                    owner,
+                    project,
+                    waste,
+                }),
+            }
+        }
+        for ((day, owner, tool), calls) in pending.skills {
+            match self
+                .skills
+                .iter_mut()
+                .find(|t| t.day == day && t.owner == owner && t.tool == tool)
+            {
+                Some(row) => row.calls += calls,
+                None => self.skills.push(ToolRow {
+                    day,
+                    owner,
+                    tool,
+                    calls,
+                }),
+            }
+        }
         for ((day, owner, tool), calls) in pending.tools {
             match self
                 .tools
@@ -404,6 +683,68 @@ impl FileSums {
                 }),
             }
         }
+    }
+
+    /// The project a line belongs to: its own working directory, or the
+    /// one the conversation was last in.
+    fn project_for(&mut self, cwd: &str) -> String {
+        if !cwd.is_empty() {
+            self.last_project = project_of(cwd);
+        }
+        if self.last_project.is_empty() {
+            "(unknown)".into()
+        } else {
+            self.last_project.clone()
+        }
+    }
+
+    /// A line the user wrote: a prompt, or the note Claude Code leaves when
+    /// the user stops a turn.
+    fn prompt(&mut self, line: &[u8], oldest_day: &str, pending: &mut Pending) {
+        let Ok(user) = serde_json::from_slice::<UserLine>(line) else {
+            return;
+        };
+        if user.is_meta || user.is_summary {
+            return;
+        }
+        let Some(text) = prompt_text(&user.message.content) else {
+            return;
+        };
+        let Some((day, _)) = day_of(&user.timestamp) else {
+            return;
+        };
+        let counted = day.as_str() >= oldest_day;
+        let project = self.project_for(&user.cwd);
+        let key = (day, self.owner.clone(), project);
+        if text.starts_with("[Request interrupted by user") {
+            if counted {
+                let waste = pending.waste.entry(key).or_default();
+                if text.contains("for tool use") {
+                    waste.tool_stops += 1;
+                } else {
+                    waste.stops += 1;
+                }
+                waste.lost_output += self.turn_output;
+            }
+            self.turn_output = 0;
+            self.after_stop = true;
+            return;
+        }
+        // Commands, their output and notices are wrapped in tags.
+        if text.trim_start().starts_with('<') {
+            return;
+        }
+        if counted {
+            let waste = pending.waste.entry(key).or_default();
+            waste.prompts += 1;
+            if self.after_stop {
+                waste.redirects += 1;
+            } else if reads_as_correction(text) {
+                waste.corrections += 1;
+            }
+        }
+        self.after_stop = false;
+        self.turn_output = 0;
     }
 
     fn reply(
@@ -424,11 +765,13 @@ impl FileSums {
         let Some((day, at_ms)) = day_of(&reply.timestamp) else {
             return;
         };
+        let (before_ms, before_model) = (self.last_ms, self.last_model.clone());
         if at_ms >= self.last_ms {
             self.last_ms = at_ms;
             self.last_model = reply.message.model.clone();
         }
         if day.as_str() < oldest_day {
+            self.after_summary = false;
             return;
         }
         // Tool calls are counted on every line: one reply is written as
@@ -438,6 +781,22 @@ impl FileSums {
                 && block.kind == "tool_use"
                 && !block.name.is_empty()
             {
+                if block.name == "Skill" && !block.input.skill.is_empty() {
+                    *pending
+                        .skills
+                        .entry((day.clone(), self.owner.clone(), block.input.skill.clone()))
+                        .or_default() += 1;
+                }
+                let edited = match block.name.as_str() {
+                    "Edit" | "Write" | "MultiEdit" => block.input.file_path.as_str(),
+                    "NotebookEdit" => block.input.notebook_path.as_str(),
+                    _ => "",
+                };
+                if !edited.is_empty() {
+                    let entry = self.edits.entry(edited.to_string()).or_default();
+                    entry.0 = day.clone();
+                    entry.1 += 1;
+                }
                 *pending
                     .tools
                     .entry((day.clone(), self.owner.clone(), block.name))
@@ -451,20 +810,49 @@ impl FileSums {
             }
             self.last_request = reply.request_id;
         }
+        self.turn_output += usage.output_tokens;
         let rebuilt = usage.cache_creation_input_tokens >= REBUILD_TOKENS
             && usage.cache_read_input_tokens < usage.cache_creation_input_tokens;
+        let project = self.project_for(&reply.cwd);
+        if rebuilt {
+            let idle = at_ms - before_ms;
+            let why = if before_ms == 0 {
+                cause::START
+            } else if self.after_summary {
+                cause::COMPACT
+            } else if idle >= LONG_IDLE_MS {
+                cause::LONG_IDLE
+            } else if idle >= SHORT_IDLE_MS {
+                cause::IDLE
+            } else if before_model != reply.message.model {
+                cause::MODEL
+            } else {
+                cause::OTHER
+            };
+            // A subagent's cache has its own, shorter lifetime, so its
+            // rebuilds are listed apart.
+            let why = if agent_type.is_empty() || why == cause::START {
+                why.to_string()
+            } else {
+                format!("{why}{}", cause::IN_SUBAGENT)
+            };
+            let entry = pending
+                .waste
+                .entry((day.clone(), self.owner.clone(), project.clone()))
+                .or_default()
+                .rebuilds
+                .entry(why)
+                .or_default();
+            entry.0 += 1;
+            entry.1 += usage.cache_creation_input_tokens;
+        }
+        self.after_summary = false;
         let agent = if agent_type.is_empty() {
             reply.attribution_agent.unwrap_or_default()
         } else {
             agent_type.to_string()
         };
-        let key = (
-            day,
-            self.owner.clone(),
-            reply.message.model,
-            project_of(&reply.cwd),
-            agent,
-        );
+        let key = (day, self.owner.clone(), reply.message.model, project, agent);
         pending.rows.entry(key).or_default().add(&Tokens {
             input: usage.input_tokens,
             output: usage.output_tokens,
@@ -481,6 +869,9 @@ impl FileSums {
         self.hooks.retain(|r| r.day.as_str() >= oldest_day);
         self.tools.retain(|r| r.day.as_str() >= oldest_day);
         self.compactions.retain(|(day, _)| day.as_str() >= oldest_day);
+        self.waste.retain(|r| r.day.as_str() >= oldest_day);
+        self.skills.retain(|r| r.day.as_str() >= oldest_day);
+        self.edits.retain(|_, (day, _)| day.as_str() >= oldest_day);
     }
 }
 
@@ -639,18 +1030,65 @@ impl Activity {
 
     /// Everything one account did from `since_day` on.
     pub fn summary(&self, owner: &str, since_day: &str) -> Summary {
+        self.summarise(Some(owner), since_day)
+    }
+
+    /// Everything every account did from `since_day` on, together.
+    pub fn summary_all(&self, since_day: &str) -> Summary {
+        self.summarise(None, since_day)
+    }
+
+    /// The account uuids that have any activity.
+    pub fn owners(&self) -> Vec<String> {
+        let owners: std::collections::BTreeSet<&str> = self
+            .files
+            .values()
+            .flat_map(|f| f.rows.iter().map(|r| r.owner.as_str()))
+            .filter(|o| !o.is_empty())
+            .collect();
+        owners.into_iter().map(String::from).collect()
+    }
+
+    /// The conversations from `since_day` on in which work was stopped,
+    /// corrected, summarised or re-cached, the most wasteful first.
+    pub fn sessions(&self, since_day: &str) -> Vec<Session> {
+        let mut sessions: Vec<Session> = self
+            .files
+            .iter()
+            .filter(|(path, _)| !path.contains("/subagents/"))
+            .filter_map(|(path, file)| {
+                let mut waste = Waste::default();
+                for row in file.waste.iter().filter(|r| r.day.as_str() >= since_day) {
+                    waste.add(&row.waste);
+                }
+                let any = waste.stops + waste.tool_stops + waste.redirects + waste.corrections > 0
+                    || waste.auto_summaries + waste.asked_summaries > 0
+                    || waste.avoidable_rebuilds().0 > 0;
+                any.then(|| Session {
+                    path: path.clone(),
+                    project: file.last_project.clone(),
+                    owner: file.owner.clone(),
+                    last_ms: file.last_ms,
+                    waste,
+                })
+            })
+            .collect();
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.waste.lost_output + s.waste.avoidable_rebuilds().1));
+        sessions
+    }
+
+    fn summarise(&self, only: Option<&str>, since_day: &str) -> Summary {
+        let is = |owner: &str| only.is_none_or(|o| o == owner);
         let mut summary = Summary::default();
+        let mut skills: BTreeMap<String, u64> = BTreeMap::new();
+        let mut by_project: BTreeMap<String, Waste> = BTreeMap::new();
         let mut models: BTreeMap<String, Tokens> = BTreeMap::new();
         let mut projects: BTreeMap<String, Tokens> = BTreeMap::new();
         let mut agents: BTreeMap<String, Tokens> = BTreeMap::new();
         let mut hooks: BTreeMap<String, (u64, u64)> = BTreeMap::new();
         let mut tools: BTreeMap<String, u64> = BTreeMap::new();
         for file in self.files.values() {
-            for row in file
-                .rows
-                .iter()
-                .filter(|r| r.owner == owner && r.day.as_str() >= since_day)
-            {
+            for row in file.rows.iter().filter(|r| is(&r.owner) && r.day.as_str() >= since_day) {
                 summary.total.add(&row.tokens);
                 models.entry(model_name(&row.model)).or_default().add(&row.tokens);
                 projects.entry(row.project.clone()).or_default().add(&row.tokens);
@@ -664,7 +1102,7 @@ impl Activity {
             for row in file
                 .hooks
                 .iter()
-                .filter(|r| r.owner == owner && r.day.as_str() >= since_day)
+                .filter(|r| is(&r.owner) && r.day.as_str() >= since_day)
             {
                 let entry = hooks.entry(row.event.clone()).or_default();
                 entry.0 += row.runs;
@@ -673,16 +1111,46 @@ impl Activity {
             for row in file
                 .tools
                 .iter()
-                .filter(|r| r.owner == owner && r.day.as_str() >= since_day)
+                .filter(|r| is(&r.owner) && r.day.as_str() >= since_day)
             {
                 *tools.entry(row.tool.clone()).or_default() += row.calls;
             }
             summary.compactions += file
                 .compactions
                 .iter()
-                .filter(|(day, who)| who == owner && day.as_str() >= since_day)
+                .filter(|(day, who)| is(who) && day.as_str() >= since_day)
                 .count() as u64;
+            for row in file
+                .waste
+                .iter()
+                .filter(|r| is(&r.owner) && r.day.as_str() >= since_day)
+            {
+                summary.waste.add(&row.waste);
+                by_project.entry(row.project.clone()).or_default().add(&row.waste);
+            }
+            for row in file
+                .skills
+                .iter()
+                .filter(|r| is(&r.owner) && r.day.as_str() >= since_day)
+            {
+                *skills.entry(row.tool.clone()).or_default() += row.calls;
+            }
+            if is(&file.owner) {
+                summary.churn.extend(
+                    file.edits
+                        .iter()
+                        .filter(|(_, (day, edits))| *edits >= CHURN_EDITS && day.as_str() >= since_day)
+                        .map(|(path, (_, edits))| (path.clone(), *edits)),
+                );
+            }
         }
+        summary.skills = skills.into_iter().collect();
+        summary.skills.sort_by_key(|s| std::cmp::Reverse(s.1));
+        summary.churn.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        summary.waste_by_project = by_project.into_iter().collect();
+        summary
+            .waste_by_project
+            .sort_by_key(|(_, w)| std::cmp::Reverse(w.lost_output + w.avoidable_rebuilds().1));
         let by_weight = |map: BTreeMap<String, Tokens>| {
             let mut rows: Vec<(String, Tokens)> = map.into_iter().collect();
             rows.sort_by(|a, b| b.1.weight().total_cmp(&a.1.weight()));
@@ -697,6 +1165,158 @@ impl Activity {
         summary.tools.sort_by_key(|t| std::cmp::Reverse(t.1));
         summary
     }
+}
+
+/// One conversation's waste, as listed by [`Activity::sessions`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Session {
+    /// The transcript file.
+    pub path: String,
+    /// The project the conversation was last in.
+    pub project: String,
+    /// The account uuid the conversation was last on.
+    pub owner: String,
+    /// When its newest reply was written, in milliseconds since the epoch.
+    pub last_ms: i64,
+    /// What was stopped, corrected, summarised and re-cached in it.
+    pub waste: Waste,
+}
+
+/// A point in a conversation where the user stopped Claude or corrected
+/// it, with the text around it. Built on request by [`moments`] for the
+/// person or agent working out why; never stored.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct Moment {
+    /// `stopped while replying`, `stopped a tool` or `correction`.
+    pub kind: String,
+    /// When, as the transcript's timestamp.
+    pub at: String,
+    /// The start of the prompt Claude was working on.
+    pub asked: String,
+    /// What Claude was doing: its last tool calls or the start of its text.
+    pub doing: String,
+    /// Tokens Claude had written in the turn up to this point.
+    pub output: u64,
+    /// The start of what the user typed next.
+    pub then: String,
+}
+
+fn clip(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > max {
+        flat.chars().take(max).collect::<String>() + "…"
+    } else {
+        flat
+    }
+}
+
+/// The last `limit` moments in one transcript where the user stopped a
+/// turn or corrected the one before. Unlike the sums, this reads message
+/// text: it is meant for a report shown to the user on their own machine.
+pub fn moments(path: &Path, limit: usize) -> Vec<Moment> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut moments: Vec<Moment> = Vec::new();
+    let (mut asked, mut doing, mut output) = (String::new(), Vec::<String>::new(), 0u64);
+    let mut open: Option<usize> = None;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut reader = BufReader::with_capacity(1 << 20, file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if find(&line, b"\"type\":\"assistant\"") {
+            let Ok(reply) = serde_json::from_slice::<AssistantLine>(&line) else {
+                continue;
+            };
+            if let Some(usage) = &reply.message.usage
+                && (reply.request_id.is_empty() || seen.insert(reply.request_id.clone()))
+            {
+                output += usage.output_tokens;
+            }
+            for block in &reply.message.content {
+                let kind = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                let said = match kind {
+                    "text" => block.get("text").and_then(|t| t.as_str()).map(|t| clip(t, 160)),
+                    "tool_use" => {
+                        let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                        let input = block.get("input");
+                        let detail = [
+                            "command",
+                            "file_path",
+                            "description",
+                            "skill",
+                            "pattern",
+                            "url",
+                            "prompt",
+                        ]
+                        .iter()
+                        .find_map(|key| input.and_then(|i| i.get(*key)).and_then(|v| v.as_str()))
+                        .unwrap_or("");
+                        Some(format!("{name}: {}", clip(detail, 120)))
+                    }
+                    _ => None,
+                };
+                if let Some(said) = said.filter(|s| !s.is_empty()) {
+                    doing.push(said);
+                    if doing.len() > 3 {
+                        doing.remove(0);
+                    }
+                }
+            }
+        } else if find(&line, b"\"type\":\"user\"") && !find(&line, b"\"type\":\"tool_result\"") {
+            let Ok(user) = serde_json::from_slice::<UserLine>(&line) else {
+                continue;
+            };
+            if user.is_meta || user.is_summary {
+                continue;
+            }
+            let Some(text) = prompt_text(&user.message.content) else {
+                continue;
+            };
+            if text.starts_with("[Request interrupted by user") {
+                let kind = if text.contains("for tool use") {
+                    "stopped a tool"
+                } else {
+                    "stopped while replying"
+                };
+                moments.push(Moment {
+                    kind: kind.into(),
+                    at: user.timestamp,
+                    asked: asked.clone(),
+                    doing: doing.join(" → "),
+                    output,
+                    then: String::new(),
+                });
+                open = Some(moments.len() - 1);
+                continue;
+            }
+            if text.trim_start().starts_with('<') {
+                continue;
+            }
+            match open.take() {
+                Some(index) => moments[index].then = clip(text, 300),
+                None if reads_as_correction(text) => moments.push(Moment {
+                    kind: "correction".into(),
+                    at: user.timestamp,
+                    asked: asked.clone(),
+                    doing: doing.join(" → "),
+                    output,
+                    then: clip(text, 300),
+                }),
+                None => {}
+            }
+            asked = clip(text, 300);
+            doing.clear();
+            output = 0;
+        }
+    }
+    let skip = moments.len().saturating_sub(limit);
+    moments.split_off(skip)
 }
 
 /// One account's activity over a span of days, as built by
@@ -723,6 +1343,16 @@ pub struct Summary {
     pub tools: Vec<(String, u64)>,
     /// How many times a conversation was compacted.
     pub compactions: u64,
+    /// Stopped turns, corrections, summaries and cache rebuilds.
+    pub waste: Waste,
+    /// The same per project, the most wasteful first.
+    pub waste_by_project: Vec<(String, Waste)>,
+    /// Skill name and number of times it was started, most used first.
+    pub skills: Vec<(String, u64)>,
+    /// Files edited [`CHURN_EDITS`] times or more in one conversation, with
+    /// the number of edits, most edited first. A file listed twice was
+    /// worked over in two conversations.
+    pub churn: Vec<(String, u32)>,
 }
 
 /// The model Claude Code used last, from the tail of the newest transcript.
@@ -927,6 +1557,135 @@ mod tests {
         let daily = activity.daily("acct-a");
         assert_eq!(daily.len(), DAYS as usize);
         assert_eq!(daily.iter().map(|d| d.1.output).sum::<u64>(), 50);
+    }
+
+    fn user(text: &str, hours_ago: i64) -> String {
+        json!({"type": "user", "timestamp": stamp(hours_ago), "cwd": "/work/app",
+            "message": {"role": "user", "content": text}})
+        .to_string()
+    }
+
+    #[test]
+    fn stops_corrections_summaries_and_rebuild_causes_are_counted() {
+        let (claude, project, store) = world();
+        let path = project.join("s1.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        let edit = json!({"type": "assistant", "timestamp": stamp(1), "cwd": "/work/app", "requestId": "e",
+            "message": {"model": "claude-fable-5-2", "content": [
+                {"type": "tool_use", "name": "Edit", "input": {"file_path": "/work/app/src/a.rs"}}],
+                "usage": {"input_tokens": 0, "output_tokens": 0}}})
+        .to_string();
+        let skill = json!({"type": "assistant", "timestamp": stamp(1), "cwd": "/work/app", "requestId": "s",
+            "message": {"model": "claude-fable-5-2", "content": [
+                {"type": "tool_use", "name": "Skill", "input": {"skill": "deploy"}}],
+                "usage": {"input_tokens": 0, "output_tokens": 0}}})
+        .to_string();
+        let summary = json!({"type": "system", "subtype": "compact_boundary", "timestamp": stamp(1),
+            "compactMetadata": {"trigger": "auto", "preTokens": 300_000, "durationMs": 4000}})
+        .to_string();
+        let tool_result = json!({"type": "user", "timestamp": stamp(1), "message": {"content": [
+            {"type": "tool_result", "content": "no, I said stop"}]}})
+        .to_string();
+        let mut lines = vec![
+            json!({"type": "session-owner", "accountUuid": "acct-a"}).to_string(),
+            user("build the thing", 1),
+            // The first reply of a conversation: a rebuild nobody could avoid.
+            reply("r1", "claude-fable-5-2", "/work/app", (10, 700, 50_000, 0), None),
+            user("[Request interrupted by user]", 1),
+            user("build it in Rust instead", 1),
+            reply("r2", "claude-fable-5-2", "/work/app", (10, 300, 100, 50_000), None),
+            user("[Request interrupted by user for tool use]", 1),
+            user("<command-name>/clear</command-name>", 1),
+            user("carry on", 1),
+            user("no, I said the other file", 1),
+            tool_result,
+            summary,
+            reply("r3", "claude-fable-5-2", "/work/app", (10, 5, 60_000, 0), None),
+            reply("r4", "claude-opus-5-5", "/work/app", (10, 5, 40_000, 0), None),
+            skill,
+        ];
+        lines.extend(std::iter::repeat_n(edit, CHURN_EDITS as usize));
+        for line in &lines {
+            writeln!(file, "{line}").unwrap();
+        }
+        let mut activity = Activity::load(&store);
+        activity.refresh(&claude, &store);
+        let s = activity.summary("acct-a", "0000-00-00");
+        let w = &s.waste;
+        assert_eq!((w.prompts, w.stops, w.tool_stops), (4, 1, 1));
+        assert_eq!(w.lost_output, 1000, "700 before the first stop, 300 before the second");
+        assert_eq!((w.redirects, w.corrections), (2, 1));
+        assert_eq!(
+            (w.auto_summaries, w.asked_summaries, w.summarised, w.summary_ms),
+            (1, 0, 300_000, 4000)
+        );
+        assert_eq!(w.rebuilds[cause::START], (1, 50_000));
+        assert_eq!(w.rebuilds[cause::COMPACT], (1, 60_000));
+        assert_eq!(w.rebuilds[cause::MODEL], (1, 40_000));
+        assert_eq!(w.avoidable_rebuilds(), (2, 100_000));
+        assert_eq!(s.skills, vec![("deploy".to_string(), 1)]);
+        assert_eq!(s.churn, vec![("/work/app/src/a.rs".to_string(), CHURN_EDITS)]);
+        assert_eq!(activity.summary_all("0000-00-00").waste, s.waste);
+        let sessions = activity.sessions("0000-00-00");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].project, "work/app");
+        // No prompt text reaches the saved sums.
+        let saved = std::fs::read_to_string(store.join("activity.json")).unwrap();
+        assert!(!saved.contains("Rust instead") && !saved.contains("I said"));
+
+        let moments = moments(&path, 10);
+        let kinds: Vec<&str> = moments.iter().map(|m| m.kind.as_str()).collect();
+        assert_eq!(kinds, ["stopped while replying", "stopped a tool", "correction"]);
+        assert_eq!(moments[0].asked, "build the thing");
+        assert_eq!(moments[0].then, "build it in Rust instead");
+        assert_eq!(moments[0].output, 700);
+        assert_eq!(moments[1].then, "carry on");
+        assert_eq!(moments[2].then, "no, I said the other file");
+    }
+
+    #[test]
+    fn a_rebuild_after_a_pause_is_blamed_on_the_pause() {
+        let (claude, project, store) = world();
+        let mut file = std::fs::File::create(project.join("s1.jsonl")).unwrap();
+        let at = |minutes_ago: i64, request: &str| {
+            json!({"type": "assistant", "timestamp": (chrono::Utc::now() - chrono::Duration::minutes(minutes_ago)).to_rfc3339(),
+                "cwd": "/work/app", "requestId": request,
+                "message": {"model": "claude-fable-5-2", "content": [], "usage": {
+                    "input_tokens": 1, "output_tokens": 1,
+                    "cache_creation_input_tokens": 30_000, "cache_read_input_tokens": 0}}})
+            .to_string()
+        };
+        for line in [at(200, "a"), at(100, "b"), at(90, "c"), at(89, "d")] {
+            writeln!(file, "{line}").unwrap();
+        }
+        let mut activity = Activity::load(&store);
+        activity.refresh(&claude, &store);
+        let w = activity.summary_all("0000-00-00").waste;
+        assert_eq!(w.rebuilds[cause::START].0, 1);
+        assert_eq!(w.rebuilds[cause::LONG_IDLE].0, 1);
+        assert_eq!(w.rebuilds[cause::IDLE].0, 1);
+        assert_eq!(w.rebuilds[cause::OTHER].0, 1);
+    }
+
+    #[test]
+    fn corrections_are_told_by_their_opening_words() {
+        for text in [
+            "No, the other one",
+            "stop doing that",
+            "that's not what I asked",
+            "Why did you delete it?",
+            "it still not working",
+        ] {
+            assert!(reads_as_correction(text), "{text}");
+        }
+        for text in [
+            "now add tests",
+            "note the port is 8080",
+            "great, ship it",
+            "know what to do next?",
+        ] {
+            assert!(!reads_as_correction(text), "{text}");
+        }
     }
 
     #[test]

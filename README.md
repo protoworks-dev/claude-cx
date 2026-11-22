@@ -115,6 +115,20 @@ It prints the session's account and its limits (`#2 work · 5h 41% · wk 63%`) f
 
 `cx auto` (and automatic switching in the dashboard and menu bar) shows a desktop notification when it switches, when an account needs a new sign-in, and when every account is at its limit. `cx config notify off` stops them.
 
+## The Claude Code plugin
+
+The [cx plugin](https://github.com/protoworks-dev/claude-plugins) lets Claude Code read what cx measures and advise on its own setup: which cache rebuilds to stop, which settings to change, what should become a skill or a hook, and why you had to stop or correct it. Its hooks also tell cx about sessions as they run.
+
+```sh
+claude plugin marketplace add protoworks-dev/claude-plugins
+claude plugin install cx@protoworks
+```
+
+The plugin reads two commands, which other tools can use too:
+
+- `cx report` prints limits, usage and waste as JSON. It works with no account added to cx, from Claude Code's transcripts alone.
+- `cx hook` takes a Claude Code hook event on standard input and records its name, session, project and a few numbers in `~/.cx/events.jsonl`. Prompt text, tool input and tool output are never written.
+
 ## Where things are
 
 | | |
@@ -123,6 +137,8 @@ It prints the session's account and its limits (`#2 work · 5h 41% · wk 63%`) f
 | Logins | macOS Keychain, service `cx-accounts` (files under `~/.cx/secrets` elsewhere) |
 | `cx run` profiles | `~/.cx/profiles/<account>` |
 | Usage history | `~/.cx/history.jsonl` |
+| Sums from the transcripts | `~/.cx/activity.json` |
+| Hook events from the plugin | `~/.cx/events.jsonl` |
 
 Environment: `CX_HOME` moves the state directory, `CX_SECRETS=file` forces file storage, `CX_CLAUDE_BIN` names the `claude` binary.
 
