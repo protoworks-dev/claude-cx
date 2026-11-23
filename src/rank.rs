@@ -33,28 +33,26 @@ pub struct Room {
 ///
 /// The 5-hour window is held to `threshold_5h`; the weekly window and the
 /// weekly windows of the models `settings` counts are held to `threshold_7d`.
-/// `now_ms` is in milliseconds since the Unix epoch. A reading with no
-/// usable window gives a room of 0, which ranks as over the line.
-pub fn room(usage: &Usage, settings: &Settings, now_ms: i64) -> Room {
+/// `own` is the account's own switch line (`cx threshold`), which replaces
+/// both when set. `now_ms` is in milliseconds since the Unix epoch. A reading
+/// with no usable window gives a room of 0, which ranks as over the line.
+pub fn room(usage: &Usage, settings: &Settings, own: Option<f64>, now_ms: i64) -> Room {
+    let line_5h = own.unwrap_or(settings.threshold_5h);
+    let line_7d = own.unwrap_or(settings.threshold_7d);
     let mut windows: Vec<(String, f64, f64, Option<i64>)> = Vec::new();
     if let Some(w) = &usage.five_hour
         && let Some(pct) = w.pct_at(now_ms)
     {
-        windows.push(("5h".into(), pct, settings.threshold_5h, w.resets_in_s(now_ms)));
+        windows.push(("5h".into(), pct, line_5h, w.resets_in_s(now_ms)));
     }
     if let Some(w) = &usage.seven_day
         && let Some(pct) = w.pct_at(now_ms)
     {
-        windows.push(("7d".into(), pct, settings.threshold_7d, w.resets_in_s(now_ms)));
+        windows.push(("7d".into(), pct, line_7d, w.resets_in_s(now_ms)));
     }
     for m in usage.models.iter().filter(|m| settings.counts_model(&m.name)) {
         if let Some(pct) = m.window.pct_at(now_ms) {
-            windows.push((
-                format!("{} week", m.name),
-                pct,
-                settings.threshold_7d,
-                m.window.resets_in_s(now_ms),
-            ));
+            windows.push((format!("{} week", m.name), pct, line_7d, m.window.resets_in_s(now_ms)));
         }
     }
     let week = usage.seven_day.as_ref();
@@ -168,7 +166,7 @@ fn judge(
     let usage = state.usage.get(&account.id).and_then(|r| r.usage.as_ref());
     let (room, base, mut note) = match usage {
         Some(u) => {
-            let r = room(u, settings, now_ms);
+            let r = room(u, settings, account.switch_line, now_ms);
             let s = score(&r, running, settings, strategy);
             let note = if r.at_limit {
                 format!("{} is at its limit", r.window)
@@ -190,6 +188,9 @@ fn judge(
             ", {running} session{} running",
             if running == 1 { "" } else { "s" }
         ));
+    }
+    if let Some(line) = account.switch_line {
+        note.push_str(&format!(", own switch line {line:.0}%"));
     }
     if account.priority != 0 {
         note.push_str(&format!(", priority {}", account.priority));
@@ -374,7 +375,7 @@ mod tests {
     #[test]
     fn room_is_the_tightest_window_against_its_own_line() {
         let s = state(&[(1, 80.0, 93.0, 100.0)]);
-        let r = room(s.usage[&1].usage.as_ref().unwrap(), &s.settings, NOW);
+        let r = room(s.usage[&1].usage.as_ref().unwrap(), &s.settings, None, NOW);
         // 5h: 90 - 80 = 10. 7d: 95 - 93 = 2.
         assert_eq!(r.window, "7d");
         assert!((r.min - 2.0).abs() < 1e-9);
@@ -399,7 +400,7 @@ mod tests {
                 },
             });
         // By default every model limit counts: #1 is over its line on Fable.
-        let r = room(s.usage[&1].usage.as_ref().unwrap(), &s.settings, NOW);
+        let r = room(s.usage[&1].usage.as_ref().unwrap(), &s.settings, None, NOW);
         assert_eq!(r.window, "Fable week");
         assert!(r.min < 0.0);
         assert_eq!(order(&s, Strategy::Headroom, &[]), vec![2, 1]);
@@ -456,6 +457,19 @@ mod tests {
     }
 
     #[test]
+    fn an_accounts_own_switch_line_replaces_the_settings() {
+        let mut s = state(&[(1, 85.0, 10.0, 48.0), (2, 85.0, 10.0, 48.0)]);
+        s.accounts.get_mut(&1).unwrap().switch_line = Some(80.0);
+        let verdicts = evaluate(&s, &BTreeMap::new(), Strategy::Balanced, NOW);
+        let of = |id: u32| verdicts.iter().find(|v| v.id == id).unwrap();
+        // 85% used: past its own line of 80, still under the default of 90.
+        assert!(of(1).room.as_ref().unwrap().min < 0.0, "{:?}", of(1));
+        assert!(of(2).room.as_ref().unwrap().min > 0.0, "{:?}", of(2));
+        assert!(of(1).note.contains("own switch line 80%"), "{}", of(1).note);
+        assert_eq!(verdicts[0].id, 2);
+    }
+
+    #[test]
     fn priority_outranks_room() {
         let mut s = state(&[(1, 10.0, 10.0, 100.0), (2, 70.0, 70.0, 100.0)]);
         s.accounts.get_mut(&2).unwrap().priority = 1;
@@ -469,7 +483,7 @@ mod tests {
             pct: Some(100.0),
             resets_at: at(-0.5),
         });
-        let r = room(s.usage[&1].usage.as_ref().unwrap(), &s.settings, NOW);
+        let r = room(s.usage[&1].usage.as_ref().unwrap(), &s.settings, None, NOW);
         assert!(!r.at_limit);
         assert_eq!(r.window, "7d");
     }

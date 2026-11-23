@@ -25,6 +25,7 @@
 //! | [`report`] | Everything cx knows as JSON, for the Claude Code plugin |
 //! | [`hook`] | What Claude Code's hooks tell cx during a session |
 //! | [`plugin`] | Installing the cx plugin for Claude Code |
+//! | [`upgrade`] | Replacing cx with the latest release |
 //! | [`run`] | Starting Claude Code on one account in one terminal |
 //! | [`accounts`] | Adding accounts: sign-in, API keys, import from claude-swap |
 //! | [`transfer`] | Encrypted export and import |
@@ -64,4 +65,5 @@ pub mod store;
 pub mod transfer;
 pub mod tui;
 pub mod ui;
+pub mod upgrade;
 pub mod util;

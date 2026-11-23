@@ -67,6 +67,11 @@ pub struct Account {
     /// Higher is preferred by every strategy.
     #[serde(default)]
     pub priority: i32,
+    /// The account's own switch line, in percent, set with `cx threshold`.
+    /// It replaces both `threshold_5h` and `threshold_7d` for this account.
+    /// `None` uses the settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_line: Option<f64>,
     /// The refresh token was rejected: the account needs `cx login`.
     #[serde(default)]
     pub needs_login: bool,
@@ -102,6 +107,7 @@ impl Account {
             plan_checked_ms: 0,
             disabled: false,
             priority: 0,
+            switch_line: None,
             needs_login: false,
             oauth_account: None,
             added_ms: crate::util::now_ms(),

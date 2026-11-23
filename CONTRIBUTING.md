@@ -28,7 +28,10 @@ CX_HOME=/tmp/cx-scratch CX_SECRETS=file cargo run
 
 ## Releasing
 
-`scripts/dist.sh` builds the four release archives into `dist/` with their `SHA256SUMS`: macOS with cargo on a Mac, Linux in a Debian 11 container (Docker), where it also runs the tests. Attach them to the GitHub release for the tag `v<version>`; `install.sh` and `cargo binstall` fetch them by name.
+1. Move the entries under `[Unreleased]` in `CHANGELOG.md` to a new `## [x.y.z] - YYYY-MM-DD` section, add its link at the foot of the file, and set the same version in `Cargo.toml` (`cargo check` updates `Cargo.lock`). The version follows Semantic Versioning: a `feat` raises the minor number, a `fix` the patch number, and a breaking change the major number (the minor number while the version starts with 0). Commit as `chore(release): x.y.z`.
+2. `scripts/dist.sh` builds the four release archives into `dist/` with their `SHA256SUMS`: macOS with cargo on a Mac, Linux in a Debian 11 container (Docker), where it also runs the tests.
+3. `gh release create vx.y.z dist/cx-vx.y.z-*.tar.gz dist/SHA256SUMS` on the release commit. `install.sh`, `cx upgrade` and `cargo binstall` fetch the archives by name.
+4. `cargo publish --locked`, or run the Release workflow for the tag.
 
 ## Rules for changes
 
@@ -42,9 +45,22 @@ CX_HOME=/tmp/cx-scratch CX_SECRETS=file cargo run
 
 ## Commits and pull requests
 
+Commit subjects and pull request titles follow [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/):
+
+```
+<type>[(scope)][!]: <description>
+```
+
+- **Types:** `feat` (something a user can now do), `fix` (something that was wrong), `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`.
+- **Scope**, optional: the module or area, such as `fix(secrets): …` or `feat(tui): …`.
+- **Description:** what the change does, starting lower case, with no full stop, in 72 characters or fewer with the rest of the subject.
+- **Breaking change:** `!` before the colon, and a `BREAKING CHANGE:` footer that says what a user must do.
+
+`scripts/check-commits.sh` checks this. Turn it on as a `commit-msg` hook in your clone with `git config core.hooksPath .githooks`; CI runs it on every pull request, title included, because a pull request is squashed and its title becomes the commit on `main`.
+
 - One logical change per pull request, with tests.
 - Describe what changes for a user, and how you checked it.
-- Add a line to `CHANGELOG.md` under "Unreleased".
+- Add an entry to `CHANGELOG.md` under `[Unreleased]`, in the section for its kind: Added, Changed, Deprecated, Removed, Fixed or Security, in that order ([Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/)). Write it for a user of cx, not for a reader of the diff. `cargo test` checks the file's form.
 
 ## Licence
 

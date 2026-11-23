@@ -8,7 +8,7 @@ use claude_cx::{
 };
 
 use anyhow::{Context, Result, bail};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use engine::Engine;
 use rank::Decision;
 use serde_json::{Value, json};
@@ -22,8 +22,7 @@ use store::{Kind, Strategy};
     about = "Several Claude accounts behind one Claude Code",
     long_about = "cx keeps a login for each of your Claude accounts, shows how much of each \
 one's limits is used, and puts your work on the account with the most room.\n\n\
-Run `cx` alone for the live dashboard.",
-    after_help = "Start here:\n  cx import-cswap     bring your accounts over from claude-swap\n  cx login            sign in to another account in the browser\n  cx                  open the dashboard\n  cx run              start Claude Code on the account with the most room\n  cx auto             keep the default login on an account with room"
+Run `cx` alone for the live dashboard."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -75,6 +74,12 @@ enum Cmd {
         #[arg(long)]
         interval: Option<u64>,
     },
+    /// Say which account Claude Code is on now, and which one cx would choose
+    Status {
+        /// Print JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Explain how cx ranks the accounts right now
     Why {
         #[arg(long)]
@@ -125,6 +130,12 @@ enum Cmd {
     Disable { account: String },
     /// Prefer an account: a higher number is used first (0 is the default)
     Priority { account: String, level: i32 },
+    /// Give an account its own switch line, in percent (no number: back to the settings)
+    Threshold {
+        account: String,
+        /// Percent used at which cx moves off this account, 1 to 100
+        percent: Option<f64>,
+    },
     /// Show settings, or set one
     Config { key: Option<String>, value: Option<String> },
     /// Run `cx auto` in the background at login (macOS)
@@ -172,6 +183,16 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<PluginCmd>,
     },
+    /// Replace cx with the latest release
+    #[command(visible_alias = "update")]
+    Upgrade {
+        /// Only say whether a newer release exists
+        #[arg(long)]
+        check: bool,
+        /// Install the latest release even when this one is not older
+        #[arg(long)]
+        force: bool,
+    },
     /// Check the setup and report anything wrong
     Doctor,
     /// Print usage and waste as JSON, for the Claude Code plugin and other tools
@@ -216,8 +237,72 @@ enum ServiceCmd {
     Status,
 }
 
+/// The commands by what they are for, in the order `cx help` shows them.
+/// Every command that is not hidden must be in one group: a test checks it.
+const GROUPS: [(&str, &[&str]); 6] = [
+    ("See what is going on", &["ls", "status", "why", "doctor"]),
+    ("Choose an account", &["use", "run", "auto", "map", "unmap"]),
+    (
+        "Add and remove accounts",
+        &["login", "add", "add-key", "import-cswap", "refresh", "rm"],
+    ),
+    (
+        "Tune how cx chooses",
+        &["alias", "priority", "threshold", "disable", "enable", "config"],
+    ),
+    (
+        "Run in the background and in Claude Code",
+        &["service", "menubar", "statusline", "plugin"],
+    ),
+    (
+        "Move, upgrade and script",
+        &["export", "import", "upgrade", "completions", "report", "hook"],
+    ),
+];
+
+const START_HERE: &str = "\
+Start here:
+  cx login            sign in to an account in the browser
+  cx add              take over the login Claude Code is using now
+  cx import-cswap     bring your accounts over from claude-swap
+  cx                  open the dashboard (press ? there for its keys)
+  cx run              start Claude Code on the account with the most room
+  cx auto             keep the default login on an account with room";
+
+/// The text of `cx help`: the commands under headings, made from the
+/// commands themselves so that it cannot name one that does not exist.
+fn grouped_help(command: &clap::Command) -> String {
+    let mut out = format!(
+        "{}\n\nUsage: cx [COMMAND]\n       cx help <COMMAND>    everything about one command\n",
+        command.get_long_about().map(|a| a.to_string()).unwrap_or_default()
+    );
+    for (heading, names) in GROUPS {
+        out.push_str(&format!("\n{heading}:\n"));
+        for name in names {
+            let Some(sub) = command.find_subcommand(name) else {
+                continue;
+            };
+            let about = sub.get_about().map(|a| a.to_string()).unwrap_or_default();
+            let aliases: Vec<&str> = sub.get_visible_aliases().collect();
+            let alias = if aliases.is_empty() {
+                String::new()
+            } else {
+                format!(" [also: {}]", aliases.join(", "))
+            };
+            out.push_str(&format!("  {name:<13} {about}{alias}\n"));
+        }
+    }
+    out.push_str("\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version\n\n");
+    out.push_str(START_HERE);
+    out.push('\n');
+    out
+}
+
 fn main() {
-    let cli = Cli::parse();
+    let command = Cli::command();
+    let help = grouped_help(&command);
+    let matches = command.override_help(help).get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     let code = match dispatch(cli) {
         Ok(code) => code,
         Err(error) => {
@@ -252,6 +337,9 @@ fn dispatch(cli: Cli) -> Result<i32> {
     // in. A failure here is reported by `cx doctor`, not by every command.
     let _ = secrets::encrypt_leftovers();
     match cli.command {
+        None if engine.store.load()?.accounts.is_empty() => {
+            println!("cx has no accounts yet.\n\n{START_HERE}\n\n`cx help` lists every command.");
+        }
         None => {
             if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
                 tui::run(engine)?;
@@ -303,6 +391,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             dry_run,
             interval,
         }) => return auto(&engine, once, dry_run, interval),
+        Some(Cmd::Status { json }) => status(&engine, json)?,
         Some(Cmd::Why { strategy }) => why(&engine, strategy)?,
         Some(Cmd::Login { account, email, sso }) => {
             let state = engine.store.load()?;
@@ -360,6 +449,9 @@ fn dispatch(cli: Cli) -> Result<i32> {
                         "Stop using cswap from here on: both tools now hold the same refresh tokens, and the first refresh by one retires the other's copy."
                     )
                 );
+                println!(
+                    "If its menu-bar item or `cswap auto` is running, stop it first: cswap menubar --uninstall-service"
+                );
             }
         }
         Some(Cmd::Refresh { account }) => {
@@ -416,6 +508,23 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 Ok(a.display())
             })?;
             ui::ok(&format!("{display}: priority {level}"));
+        }
+        Some(Cmd::Threshold { account, percent }) => {
+            if let Some(p) = percent
+                && !(1.0..=100.0).contains(&p)
+            {
+                bail!("the switch line is a percentage from 1 to 100");
+            }
+            let display = engine.store.update(|state| {
+                let id = state.resolve(&account)?.id;
+                let a = state.accounts.get_mut(&id).unwrap();
+                a.switch_line = percent;
+                Ok(a.display())
+            })?;
+            match percent {
+                Some(p) => ui::ok(&format!("{display}: cx moves off it at {p:.0}% used")),
+                None => ui::ok(&format!("{display}: back to the switch lines in the settings")),
+            }
         }
         Some(Cmd::Config { key, value }) => config(&engine, key, value)?,
         Some(Cmd::Service { action }) => match action {
@@ -485,6 +594,33 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 }
             }
         },
+        Some(Cmd::Upgrade { check, force }) => {
+            use claude_cx::upgrade;
+            let this = env!("CARGO_PKG_VERSION");
+            if check {
+                let latest = upgrade::latest()?;
+                if latest.newer {
+                    ui::note(&format!(
+                        "cx {} is out; this is {this}. `cx upgrade` installs it.",
+                        latest.version
+                    ));
+                } else {
+                    ui::ok(&format!("cx {this} is the latest release"));
+                }
+                return Ok(0);
+            }
+            match upgrade::upgrade(force)? {
+                upgrade::Outcome::Current(latest) => {
+                    ui::ok(&format!("cx {this} is up to date (latest release: {latest})"))
+                }
+                upgrade::Outcome::Replaced(version, path) => {
+                    ui::ok(&format!("cx {version} is now at {} (was {this})", path.display()));
+                    ui::note(
+                        "A dashboard, menu-bar item or `cx auto` that is running keeps the old version until it is restarted.",
+                    );
+                }
+            }
+        }
         Some(Cmd::Doctor) => return doctor(&engine),
         Some(Cmd::Hook) => {}
         Some(Cmd::Report { days, .. }) => {
@@ -581,6 +717,55 @@ fn set_flag(engine: &Engine, account: &str, disabled: bool) -> Result<()> {
             "back in automatic selection"
         }
     ));
+    Ok(())
+}
+
+/// `cx status`: the default login, what this directory is pinned to, and
+/// the account cx would choose. Reads only what cx already knows.
+fn status(engine: &Engine, as_json: bool) -> Result<()> {
+    let snapshot = engine.snapshot(false, false)?;
+    let state = &snapshot.state;
+    let name = |id: u32| {
+        state
+            .accounts
+            .get(&id)
+            .map(|a| a.display())
+            .unwrap_or_else(|| format!("#{id}"))
+    };
+    let best = engine.pick(None, &snapshot).map(|v| v.id);
+    let pin = pinned(engine)?.map(|launch| launch.account.id);
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schemaVersion": 1,
+                "version": env!("CARGO_PKG_VERSION"),
+                "defaultLogin": snapshot.live,
+                "defaultLoginUnmanaged": snapshot.live_unmanaged,
+                "pinnedHere": pin,
+                "best": best,
+                "strategy": state.settings.strategy,
+                "accounts": state.accounts.len(),
+            }))?
+        );
+        return Ok(());
+    }
+    match snapshot.live {
+        Some(_) => println!("default login   {}", statusline(engine)?),
+        None if snapshot.live_unmanaged => {
+            println!("default login   not one of cx's accounts (`cx add` takes it over)")
+        }
+        None => println!("default login   Claude Code is signed out (`cx use` signs it in)"),
+    }
+    if let Some(id) = pin {
+        println!("this directory  pinned to {}", name(id));
+    }
+    match best {
+        Some(id) if Some(id) == snapshot.live => println!("best now        the same account"),
+        Some(id) => println!("best now        {}", name(id)),
+        None => println!("best now        no account has room"),
+    }
+    println!("choosing by     {}", state.settings.strategy);
     Ok(())
 }
 
@@ -1089,4 +1274,30 @@ fn read_secret(prompt: &str) -> Result<String> {
     eprintln!();
     read?;
     Ok(line.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_visible_command_is_in_one_help_group() {
+        let command = Cli::command();
+        let grouped: Vec<&str> = GROUPS.iter().flat_map(|(_, names)| names.iter().copied()).collect();
+        for sub in command.get_subcommands().filter(|s| !s.is_hide_set()) {
+            let count = grouped.iter().filter(|n| **n == sub.get_name()).count();
+            assert_eq!(count, 1, "`{}` must be in exactly one help group", sub.get_name());
+        }
+        for name in &grouped {
+            assert!(
+                command.find_subcommand(name).is_some(),
+                "help names `{name}`, which is not a command"
+            );
+        }
+        let help = grouped_help(&command);
+        assert!(
+            help.contains("See what is going on:") && help.contains("  threshold "),
+            "{help}"
+        );
+    }
 }

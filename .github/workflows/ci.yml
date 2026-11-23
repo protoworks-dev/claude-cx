@@ -27,6 +27,22 @@ env:
 # pull request from a fork: that would execute a stranger's code on them. A
 # maintainer starts CI for such a pull request by hand after reading it.
 jobs:
+  commits:
+    name: Conventional Commits
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ vars.CI_RUNNER || 'skunkworks-ci' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # A pull request is squashed, so its title becomes the commit on main.
+      - name: Pull request title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: scripts/check-commits.sh --title "$TITLE"
+      - name: Commits
+        run: scripts/check-commits.sh --range "origin/${{ github.base_ref }}..HEAD"
+
   check:
     name: Linux
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
