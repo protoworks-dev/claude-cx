@@ -14,7 +14,7 @@
 //! | Module | What it holds |
 //! |---|---|
 //! | [`store`] | Accounts, settings and the last usage readings, in `state.json` |
-//! | [`secrets`] | Logins and keys, in the macOS Keychain or owner-only files |
+//! | [`secrets`] | Logins and keys: the macOS Keychain, or age-encrypted files, or fnox |
 //! | [`cred`] | The shape of a Claude Code login |
 //! | [`claude`] | Claude Code's own files, Keychain items and locks |
 //! | [`api`] | The three Anthropic endpoints cx calls |

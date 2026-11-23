@@ -233,6 +233,9 @@ fn dispatch(cli: Cli) -> Result<i32> {
         return Ok(0);
     }
     let engine = Engine::open()?;
+    // Logins an earlier version left unencrypted are encrypted on the way
+    // in. A failure here is reported by `cx doctor`, not by every command.
+    let _ = secrets::encrypt_leftovers();
     match cli.command {
         None => {
             if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
@@ -523,8 +526,8 @@ fn report_switch(engine: &Engine, outcome: &engine::Switched) -> Result<()> {
     ui::ok(&format!("default login is now {name}"));
     if let Some(stash) = &outcome.stashed {
         ui::warn(&format!(
-            "the previous default login was not one of cx's accounts. It was kept in the Keychain as '{stash}' (service '{}').",
-            secrets::SERVICE
+            "the previous default login was not one of cx's accounts. It was kept as '{stash}' in {}.",
+            secrets::place()
         ));
     }
     ui::note("Running Claude Code sessions pick it up within about 30 seconds; a restart applies it at once.");
@@ -822,16 +825,45 @@ fn doctor(engine: &Engine) -> Result<i32> {
             ),
         ),
     }
-    check(
-        true,
-        format!(
-            "secrets are kept in {}",
-            match secrets::backend() {
-                secrets::Backend::Keychain => "the macOS Keychain".to_string(),
-                secrets::Backend::File => format!("files under {}", util::store_root().join("secrets").display()),
+    check(true, format!("secrets are kept in {}", secrets::place()));
+    match secrets::backend() {
+        secrets::Backend::Age | secrets::Backend::Fnox => {
+            let (key, source) = secrets::age_key_file();
+            let whose = match source {
+                secrets::KeySource::Env(name) => format!("named by {name}"),
+                secrets::KeySource::Shared => "shared with fnox, mise or sops".to_string(),
+                secrets::KeySource::Own => "cx's own".to_string(),
+            };
+            // With fnox the key only matters while cx's own config is in use.
+            if secrets::backend() == secrets::Backend::Age || !secrets::fnox_config().exists() {
+                check(
+                    key.is_file() || source == secrets::KeySource::Own,
+                    format!(
+                        "age key: {} ({whose}{})",
+                        key.display(),
+                        if key.is_file() {
+                            ""
+                        } else {
+                            ", made when the first login is stored"
+                        }
+                    ),
+                );
             }
+            match secrets::encrypt_leftovers() {
+                Ok(0) => {}
+                Ok(moved) => check(true, format!("{moved} secret(s) from an earlier store were encrypted")),
+                Err(error) => check(
+                    false,
+                    format!("secrets from an earlier store could not be moved: {error:#}"),
+                ),
+            }
+        }
+        secrets::Backend::File => check(
+            true,
+            "CX_SECRETS=file: the logins are readable by you only, but not encrypted".to_string(),
         ),
-    );
+        secrets::Backend::Keychain => {}
+    }
     for name in claude::AUTH_OVERRIDE_ENV {
         if std::env::var_os(name).is_some() {
             check(

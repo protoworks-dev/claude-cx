@@ -14,10 +14,14 @@ It is a Rust rewrite of the ideas in [claude-swap](https://github.com/realiti4/c
 ## Install
 
 ```bash
-cargo install claude-cx
+cargo install --locked claude-cx
 ```
 
-This installs one command, `cx`. It needs [Claude Code](https://claude.com/claude-code) installed and Rust 1.88 or newer to build. macOS is the supported platform (logins live in the Keychain); it builds on Linux with file-backed storage, where the menu-bar item and the background service are not available.
+This installs one command, `cx`. It needs [Claude Code](https://claude.com/claude-code) installed, and Rust 1.88 or newer and a C compiler to build. `--locked` builds with the dependency versions the release was tested with. To install the code as it is on `main`: `cargo install --locked --git https://github.com/protoworks-dev/claude-cx`.
+
+macOS is the main platform: logins live in the Keychain. On Linux, which has no Keychain, cx encrypts them with [age](https://age-encryption.org) (see [Where logins are kept](#where-logins-are-kept)); the menu-bar item and the background service are macOS only.
+
+If `cargo` itself fails before anything compiles, the cause is the toolchain setup and not cx: `rustc -vV` must work in the directory you install from. Two cases seen: a version manager's `cargo` shim with no version chosen for that directory (use rustup's `~/.cargo/bin/cargo`), and a `RUSTC_WRAPPER` such as sccache whose server is not answering (`RUSTC_WRAPPER= cargo install --locked claude-cx` builds without it).
 
 ## Start
 
@@ -134,13 +138,32 @@ The plugin reads two commands, which other tools can use too:
 | | |
 |---|---|
 | State and settings | `~/.cx/state.json` |
-| Logins | macOS Keychain, service `cx-accounts` (files under `~/.cx/secrets` elsewhere) |
+| Logins | macOS Keychain, service `cx-accounts`. Without a Keychain: age files under `~/.cx/secrets` |
 | `cx run` profiles | `~/.cx/profiles/<account>` |
 | Usage history | `~/.cx/history.jsonl` |
 | Sums from the transcripts | `~/.cx/activity.json` |
 | Hook events from the plugin | `~/.cx/events.jsonl` |
 
-Environment: `CX_HOME` moves the state directory, `CX_SECRETS=file` forces file storage, `CX_CLAUDE_BIN` names the `claude` binary.
+Environment: `CX_HOME` moves the state directory, `CX_SECRETS` chooses where logins are kept (below), `CX_CLAUDE_BIN` names the `claude` binary.
+
+### Where logins are kept
+
+| `CX_SECRETS` | Store |
+|---|---|
+| unset, on macOS | The login Keychain |
+| unset elsewhere, or `age` | One age file per login, `~/.cx/secrets/acct-<n>.age` |
+| `fnox` | [fnox](https://fnox.jdx.dev), through the `fnox` command |
+| `file` | Plain files that only you can read, not encrypted. For tests |
+
+**age.** Each login is encrypted to an age key file, and `age -d -i <key file> ~/.cx/secrets/acct-1.age` opens one without cx. cx uses the first of these: `CX_AGE_KEY_FILE`; the file named by `FNOX_AGE_KEY_FILE`, `SOPS_AGE_KEY_FILE` or `MISE_SOPS_AGE_KEY_FILE`; an existing `~/.config/fnox/age.txt`, `~/.config/mise/age.txt` or `~/.config/sops/age/keys.txt`; and otherwise its own `~/.cx/age.key`, which it creates. So a machine that already keeps secrets with fnox, mise or sops uses that one key for cx too. `cx doctor` names the key in use. If the key file is lost the logins cannot be opened, and each account needs `cx login` again.
+
+A key that cx made sits on the same disk as the logins, so it protects a backup or a synced copy of `~/.cx/secrets` that does not include the key, and not against someone who can read your whole home directory. Keep the key somewhere else (`CX_AGE_KEY_FILE`) for more than that.
+
+**fnox.** `CX_SECRETS=fnox` keeps each login as a fnox secret named `CX_ACCT_<n>` in `~/.cx/fnox.toml` (`CX_FNOX_CONFIG` names another file). cx writes that file with one age provider on the key above. Edit it, or point `CX_FNOX_CONFIG` at a config of your own, to use any provider fnox has, such as a cloud secret manager or a password manager; `CX_FNOX_PROVIDER` picks a provider that is not the config's default. The value is handed to fnox on standard input, never on its command line.
+
+Logins left by another store are moved the first time cx runs: plain files from before 0.6 into age, and plain or age files into fnox.
+
+This is cx's own copy of each login. Claude Code keeps the login it is using in its own place, which outside macOS is a plain `.credentials.json` in its config directory; cx cannot change that.
 
 ## Settings
 

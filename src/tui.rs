@@ -3161,7 +3161,10 @@ fn draw_modal(frame: &mut Frame, area: Rect, snapshot: &Snapshot, app: &mut App)
                 Line::default(),
                 match error {
                     Some(text) => Line::from(Span::styled(text, Style::new().fg(bad()))),
-                    None => hint("Paste the key. It goes to the macOS Keychain and is not shown again."),
+                    None => hint(&format!(
+                        "Paste the key. It goes to {} and is not shown again.",
+                        crate::secrets::place()
+                    )),
                 },
                 hint("Storing a key turns on its use when every subscription is at its limit."),
                 Line::default(),

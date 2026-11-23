@@ -18,20 +18,24 @@ env:
   RUSTFLAGS: -D warnings
   RUSTDOCFLAGS: -D warnings
 
+# Where the jobs run is a repository variable, not a label in this file:
+#   CI_RUNNER        the Linux runner. Unset, it is the organisation's own
+#                    runners (label skunkworks-ci). `ubuntu-latest` uses GitHub's.
+#   CI_MACOS_RUNNER  a macOS runner, for example `macos-latest`. Unset, the
+#                    macOS job is skipped.
+# The organisation's runners are its own machines, so nothing here runs for a
+# pull request from a fork: that would execute a stranger's code on them. A
+# maintainer starts CI for such a pull request by hand after reading it.
 jobs:
   check:
-    name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, ubuntu-latest]
+    name: Linux
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ vars.CI_RUNNER || 'skunkworks-ci' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --check
       - name: Lint
@@ -40,23 +44,41 @@ jobs:
         run: cargo test --locked
       - name: Docs
         run: cargo doc --no-deps --locked
+      - name: Install as a user would
+        run: |
+          cargo install --locked --path . --root "$RUNNER_TEMP/cx-install"
+          "$RUNNER_TEMP/cx-install/bin/cx" --version
+
+  macos:
+    name: macOS
+    if: vars.CI_MACOS_RUNNER != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ${{ vars.CI_MACOS_RUNNER || 'macos-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Lint
+        run: cargo clippy --all-targets --locked
+      - name: Test
+        run: cargo test --locked
 
   msrv:
     name: Minimum Rust version
-    runs-on: macos-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ vars.CI_RUNNER || 'skunkworks-ci' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.88"
-      - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked
 
   package:
     name: Package
-    runs-on: macos-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ vars.CI_RUNNER || 'skunkworks-ci' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo package --locked
+      - run: cargo package --locked --target-dir "$RUNNER_TEMP/cx-package"
