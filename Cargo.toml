@@ -11,7 +11,7 @@ documentation = "https://docs.rs/claude-cx"
 readme = "README.md"
 keywords = ["claude", "claude-code", "accounts", "tui", "cli"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = [".github/", "tests/"]
+exclude = [".github/", "tests/", "docs/", "scripts/"]
 
 [[bin]]
 name = "cx"

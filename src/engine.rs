@@ -142,8 +142,8 @@ impl Engine {
 
     // ---- secrets -------------------------------------------------------
 
-    /// Read an account's login from cx's secret store (the macOS Keychain or
-    /// the file backend). `None` when nothing is stored or the stored text
+    /// Read an account's login from cx's secret store (see
+    /// [`secrets::backend`]). `None` when nothing is stored or the stored text
     /// is not an OAuth login, as for an API key or a setup-token.
     pub fn read_secret(&self, account: &Account) -> Result<Option<Oauth>> {
         Ok(secrets::get(&account.secret_name())?.and_then(|t| Oauth::from_credential(&t)))
@@ -394,9 +394,9 @@ impl Engine {
                 let name = format!("{}.reply-{}", account.secret_name(), now_ms());
                 secrets::set(&name, &body)?;
                 bail!(
-                    "{}: the token endpoint answered in a shape cx does not know. Its reply is kept in the Keychain as '{name}' (service '{}') so the new token is not lost. Please report this.",
+                    "{}: the token endpoint answered in a shape cx does not know. Its reply is kept as '{name}' in {} so the new token is not lost. Please report this.",
                     account.display(),
-                    secrets::SERVICE
+                    secrets::place()
                 )
             }
             Err(e) => bail!("{}: could not refresh the token ({e})", account.display()),

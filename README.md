@@ -7,6 +7,8 @@
 
 Several Claude accounts behind one Claude Code. The `cx` command keeps a login for each account, shows how much of each one's limits is used and what used it, and puts your work on the account with the most room.
 
+![The cx dashboard: four accounts with their limits, the selected account in detail, and which account is next](docs/screenshots/dashboard.svg)
+
 It is a Rust rewrite of the ideas in [claude-swap](https://github.com/realiti4/claude-swap), with its own sign-in, its own token renewal, a load balancer and a dashboard.
 
 > **Not an Anthropic product.** claude-cx is not affiliated with or endorsed by Anthropic. Whether you may hold and rotate several accounts is governed by Anthropic's terms for those accounts; read them before using this, because the accounts are yours to lose. The tool only ever talks to Anthropic's own endpoints with your own logins.
@@ -14,10 +16,14 @@ It is a Rust rewrite of the ideas in [claude-swap](https://github.com/realiti4/c
 ## Install
 
 ```bash
-cargo install claude-cx
+cargo install --locked claude-cx
 ```
 
-This installs one command, `cx`. It needs [Claude Code](https://claude.com/claude-code) installed and Rust 1.88 or newer to build. macOS is the supported platform (logins live in the Keychain); it builds on Linux with file-backed storage, where the menu-bar item and the background service are not available.
+This installs one command, `cx`. It needs [Claude Code](https://claude.com/claude-code) installed, and Rust 1.88 or newer and a C compiler to build. `--locked` builds with the dependency versions the release was tested with. To install the code as it is on `main`: `cargo install --locked --git https://github.com/protoworks-dev/claude-cx`.
+
+macOS is the main platform: logins live in the Keychain. On Linux, which has no Keychain, cx encrypts them with [age](https://age-encryption.org) (see [Where logins are kept](#where-logins-are-kept)); the menu-bar item and the background service are macOS only.
+
+If `cargo` itself fails before anything compiles, the cause is the toolchain setup and not cx: `rustc -vV` must work in the directory you install from. Two cases seen: a version manager's `cargo` shim with no version chosen for that directory (use rustup's `~/.cargo/bin/cargo`), and a `RUSTC_WRAPPER` such as sccache whose server is not answering (`RUSTC_WRAPPER= cargo install --locked claude-cx` builds without it).
 
 ## Start
 
@@ -47,6 +53,7 @@ Without claude-swap: `cx add` takes over the login Claude Code is using now, and
 | `cx export backup.cx` | Every account, login and setting in one passphrase-encrypted file. `cx import` restores it |
 | `cx statusline` | One line for Claude Code's status bar |
 | `cx completions zsh` | Shell completion script |
+| `cx plugin` | Install the cx plugin for Claude Code, or update it |
 | `cx doctor` | Check the setup |
 
 An account is named by number, alias (`cx alias 3 work`), email, or any unambiguous part of one.
@@ -60,6 +67,16 @@ An account is named by number, alias (`cx alias 3 work`), email, or any unambigu
 - **Which account next.** The order cx would use the accounts in, once for Fable work and once for other models.
 - **API keys.** A table with an "add" row. A key is typed or pasted into a pop-up and never shown; storing one turns on its use when every subscription is at its limit.
 - **Settings** (`S`). A list; Enter opens an editor that fits the value: up and down for a number, a list for a choice, a checklist for the shared entries.
+
+| Waste and speed (`v`) | Settings (`S`) |
+|---|---|
+| ![The second page of cards: cache rebuilds, stops and corrections, hook time](docs/screenshots/waste.svg) | ![The settings list with an editor for each value](docs/screenshots/settings.svg) |
+
+The same numbers without the dashboard, for a script or a glance:
+
+![cx ls and cx why in a plain terminal](docs/screenshots/list.svg)
+
+The pictures show made-up accounts. `python3 scripts/screenshots.py` makes them again from the real program.
 
 The breakdown is read from Claude Code's own transcripts under `~/.claude/projects`, which name the account each session ran on. Use from another computer or from claude.ai counts against an account's limits but leaves no record here. Shares are weighted the way the API prices tokens; the subscription limits are not published, so they are a yardstick and not the server's count. cx only reads the transcripts and keeps sums, never message text, in `~/.cx/activity.json`.
 
@@ -120,6 +137,12 @@ It prints the session's account and its limits (`#2 work · 5h 41% · wk 63%`) f
 The [cx plugin](https://github.com/protoworks-dev/claude-plugins) lets Claude Code read what cx measures and advise on its own setup: which cache rebuilds to stop, which settings to change, what should become a skill or a hook, and why you had to stop or correct it. Its hooks also tell cx about sessions as they run.
 
 ```sh
+cx plugin
+```
+
+That one command adds the Protoworks marketplace to Claude Code and installs the plugin, or updates both when they are already there; `cx plugin status` and `cx plugin remove` do what they say. It runs Claude Code's own commands, which you can also type yourself:
+
+```sh
 claude plugin marketplace add protoworks-dev/claude-plugins
 claude plugin install cx@protoworks
 ```
@@ -134,13 +157,32 @@ The plugin reads two commands, which other tools can use too:
 | | |
 |---|---|
 | State and settings | `~/.cx/state.json` |
-| Logins | macOS Keychain, service `cx-accounts` (files under `~/.cx/secrets` elsewhere) |
+| Logins | macOS Keychain, service `cx-accounts`. Without a Keychain: age files under `~/.cx/secrets` |
 | `cx run` profiles | `~/.cx/profiles/<account>` |
 | Usage history | `~/.cx/history.jsonl` |
 | Sums from the transcripts | `~/.cx/activity.json` |
 | Hook events from the plugin | `~/.cx/events.jsonl` |
 
-Environment: `CX_HOME` moves the state directory, `CX_SECRETS=file` forces file storage, `CX_CLAUDE_BIN` names the `claude` binary.
+Environment: `CX_HOME` moves the state directory, `CX_SECRETS` chooses where logins are kept (below), `CX_CLAUDE_BIN` names the `claude` binary.
+
+### Where logins are kept
+
+| `CX_SECRETS` | Store |
+|---|---|
+| unset, on macOS | The login Keychain |
+| unset elsewhere, or `age` | One age file per login, `~/.cx/secrets/acct-<n>.age` |
+| `fnox` | [fnox](https://fnox.jdx.dev), through the `fnox` command |
+| `file` | Plain files that only you can read, not encrypted. For tests |
+
+**age.** Each login is encrypted to an age key file, and `age -d -i <key file> ~/.cx/secrets/acct-1.age` opens one without cx. cx uses the first of these: `CX_AGE_KEY_FILE`; the file named by `FNOX_AGE_KEY_FILE`, `SOPS_AGE_KEY_FILE` or `MISE_SOPS_AGE_KEY_FILE`; an existing `~/.config/fnox/age.txt`, `~/.config/mise/age.txt` or `~/.config/sops/age/keys.txt`; and otherwise its own `~/.cx/age.key`, which it creates. So a machine that already keeps secrets with fnox, mise or sops uses that one key for cx too. `cx doctor` names the key in use. If the key file is lost the logins cannot be opened, and each account needs `cx login` again.
+
+A key that cx made sits on the same disk as the logins, so it protects a backup or a synced copy of `~/.cx/secrets` that does not include the key, and not against someone who can read your whole home directory. Keep the key somewhere else (`CX_AGE_KEY_FILE`) for more than that.
+
+**fnox.** `CX_SECRETS=fnox` keeps each login as a fnox secret named `CX_ACCT_<n>` in `~/.cx/fnox.toml` (`CX_FNOX_CONFIG` names another file). cx writes that file with one age provider on the key above. Edit it, or point `CX_FNOX_CONFIG` at a config of your own, to use any provider fnox has, such as a cloud secret manager or a password manager; `CX_FNOX_PROVIDER` picks a provider that is not the config's default. The value is handed to fnox on standard input, never on its command line.
+
+Logins left by another store are moved the first time cx runs: plain files from before 0.6 into age, and plain or age files into fnox.
+
+This is cx's own copy of each login. Claude Code keeps the login it is using in its own place, which outside macOS is a plain `.credentials.json` in its config directory; cx cannot change that.
 
 ## Settings
 

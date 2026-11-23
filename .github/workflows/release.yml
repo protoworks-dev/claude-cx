@@ -11,7 +11,8 @@ permissions:
 
 jobs:
   publish:
-    runs-on: macos-latest
+    # See ci.yml for CI_RUNNER.
+    runs-on: ${{ vars.CI_RUNNER || 'skunkworks-ci' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

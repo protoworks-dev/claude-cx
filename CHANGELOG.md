@@ -4,15 +4,26 @@ All notable changes are recorded here. The format follows [Keep a Changelog](htt
 
 ## Unreleased
 
+### Security
+
+- On a system without a Keychain (Linux), logins and API keys are now encrypted with age instead of being kept in plain files. The key is the one fnox, mise or sops already uses when there is one, else a key cx makes in `~/.cx/age.key`. Plain files left by 0.5 are encrypted the first time cx runs. `CX_SECRETS=file` keeps the old behaviour.
+
 ### Fixed
 
 - Switching or renewing a login no longer signs Claude Code out when its Keychain item is large. Since 0.5.0, a login that also held MCP server sign-ins (anything too long for the `security` tool's standard input) was moved to the plaintext file and the Keychain item removed; Claude Code on macOS reads only the Keychain item, so it was left signed out. The item now stays in the Keychain. 0.4.0 is not affected.
 
 ### Added
 
+- `cx plugin` installs the cx plugin for Claude Code in one command: it adds the Protoworks marketplace and installs the plugin, or updates both. `cx plugin status` and `cx plugin remove` go with it, and `cx doctor` says whether the plugin is there.
+- Screenshots in the README, made from the real program on made-up accounts by `scripts/screenshots.py`.
+- `CX_SECRETS=fnox` keeps the logins in fnox, with any provider fnox has. `cx doctor` says where the logins are and which age key opens them.
 - More is read from the transcripts, all of it kept as counts on this machine: thinking tokens by effort level, cache writes by lifetime, how much text each tool put into conversations and how often it failed, time and added text per hook command, hooks that blocked or were cancelled, refused tool calls, work done under each skill, plugin and MCP server, API errors, turn times, the size of the lists sent at every session start, and summaries made while idle. `cx report` carries them all.
 - The dashboard's cards are on two pages, "Usage" and "Waste and speed" (`v`, or click). A line above the cards names the largest loss of tokens and of time. Cards carry their headline figure in the title.
 - `keep_awake` setting (off by default, macOS). With the plugin's hooks, the end of a turn on a large conversation holds the Mac awake for 80 minutes, so Claude Code can summarise the conversation before its cache expires. Sending a prompt or ending the session releases it. Without this, a Mac that sleeps first pays for the whole conversation again on the next prompt.
+
+### Changed
+
+- CI runs on a runner named by the `CI_RUNNER` repository variable (the organisation's own runners when unset), and installs the package the way a user does. It no longer runs for pull requests from forks.
 
 ## 0.5.0 - 2026-11-22
 

@@ -1102,3 +1102,170 @@ fn hooks_are_recorded_and_the_report_counts_stops_without_any_account() {
     assert_eq!(moments["moments"][0]["asked"], "build the thing");
     assert_eq!(moments["moments"][0]["then"], "use the other file");
 }
+
+#[test]
+fn without_a_keychain_logins_are_age_encrypted_and_older_plain_files_are_moved() {
+    // The accounts are added the way 0.5 kept them: plain files.
+    let world = World::with_two_accounts();
+    let secrets = world.home.join(".cx/secrets");
+    assert!(secrets.join("acct-1.secret").exists());
+    let age = [("CX_SECRETS", "age")];
+
+    // The first command under age encrypts what it finds.
+    let listed = world.cx_with(&["ls", "--offline", "--json"], &age);
+    assert_eq!(listed.code, 0, "{}", listed.err);
+    for id in [1, 2] {
+        assert!(!secrets.join(format!("acct-{id}.secret")).exists(), "plain copy left");
+        let sealed = std::fs::read_to_string(secrets.join(format!("acct-{id}.age"))).unwrap();
+        assert!(sealed.starts_with("-----BEGIN AGE ENCRYPTED FILE-----"), "{sealed}");
+        assert!(
+            !sealed.contains("rt:") && !sealed.contains("at:"),
+            "a token is readable"
+        );
+    }
+    let key = world.home.join(".cx/age.key");
+    let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    assert!(std::fs::read_to_string(&key).unwrap().contains("AGE-SECRET-KEY-"));
+
+    // The encrypted logins work: account 1 becomes the default login.
+    let switched = world.cx_with(&["use", "1"], &age);
+    assert_eq!(switched.code, 0, "{}", switched.err);
+    assert_eq!(world.live_access(), "at:A:1");
+    let doctor = world.cx_with(&["doctor"], &age);
+    assert!(doctor.out.contains("age-encrypted files"), "{}", doctor.out);
+    assert!(doctor.out.contains("cx's own"), "{}", doctor.out);
+
+    // With the key file gone the logins cannot be opened: cx says so and
+    // changes nothing.
+    let other = world.home.join("other.key");
+    let refused = world.cx_with(
+        &["use", "2"],
+        &[("CX_SECRETS", "age"), ("CX_AGE_KEY_FILE", other.to_str().unwrap())],
+    );
+    assert_ne!(refused.code, 0);
+    assert!(refused.err.contains("is missing"), "{}", refused.err);
+    assert_eq!(world.live_access(), "at:A:1");
+}
+
+#[test]
+fn fnox_keeps_the_logins_when_asked_to() {
+    let world = World::with_two_accounts();
+    // A stand-in for fnox with its real interface: the value arrives on
+    // stdin, `get` adds a newline, and a missing secret is exit 1 with
+    // `secret::not_found`.
+    let script = r#"#!/bin/sh
+[ "$1" = "-c" ] && [ "$3" = "--non-interactive" ] && [ "$4" = "--no-color" ] || { echo "unexpected arguments: $*" >&2; exit 2; }
+[ -f "$2" ] || { echo "Error: fnox::config::read_failed" >&2; exit 1; }
+store="$2.d"; mkdir -p "$store"; key=$6
+missing() { echo "Error: fnox::secret::not_found" >&2; exit 1; }
+case "$5" in
+  get) [ -f "$store/$key" ] || missing; cat "$store/$key"; echo ;;
+  set) cat > "$store/$key" ;;
+  remove) [ -f "$store/$key" ] || missing; rm "$store/$key" ;;
+  *) echo "unexpected command: $5" >&2; exit 2 ;;
+esac
+"#;
+    let fake = world.home.join("fake-fnox");
+    std::fs::write(&fake, script).unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let fnox = [("CX_SECRETS", "fnox"), ("CX_FNOX_BIN", fake.to_str().unwrap())];
+
+    let listed = world.cx_with(&["ls", "--offline", "--json"], &fnox);
+    assert_eq!(listed.code, 0, "{}", listed.err);
+    // cx wrote its own config, with an age provider on a key it made.
+    let config = std::fs::read_to_string(world.home.join(".cx/fnox.toml")).unwrap();
+    assert!(config.contains("default_provider = \"cx\""), "{config}");
+    assert!(
+        config.contains("type = \"age\"") && config.contains("recipients = [\"age1"),
+        "{config}"
+    );
+    // The plain files went into fnox under environment-variable names.
+    let store = world.home.join(".cx/fnox.toml.d");
+    let kept = std::fs::read_to_string(store.join("CX_ACCT_1")).unwrap();
+    assert!(kept.contains("rt:A:1"), "{kept}");
+    assert!(!kept.ends_with('\n'));
+    assert!(store.join("CX_ACCT_2").exists());
+    assert!(!world.home.join(".cx/secrets/acct-1.secret").exists());
+
+    let switched = world.cx_with(&["use", "1"], &fnox);
+    assert_eq!(switched.code, 0, "{}", switched.err);
+    assert_eq!(world.live_access(), "at:A:1");
+
+    // Without the fnox command cx says what is wrong.
+    let absent = world.cx_with(
+        &["use", "2"],
+        &[("CX_SECRETS", "fnox"), ("CX_FNOX_BIN", "/nonexistent/fnox")],
+    );
+    assert_ne!(absent.code, 0);
+    assert!(absent.err.contains("fnox"), "{}", absent.err);
+}
+
+#[test]
+fn one_command_installs_the_plugin_through_claude_code() {
+    let world = World::new();
+    // A stand-in for `claude plugin`: it remembers what was added and
+    // installed, and notes every call.
+    let script = r#"#!/bin/sh
+echo "$*" >> "$HOME/claude-calls"
+[ -n "$CLAUDE_CONFIG_DIR" ] && echo "config dir leaked" >> "$HOME/claude-calls"
+case "$*" in
+  "plugin marketplace list --json")
+    if [ -f "$HOME/marketplace" ]; then echo '[{"name":"protoworks","source":"github","repo":"protoworks-dev/claude-plugins"}]'; else echo '[]'; fi ;;
+  "plugin list --json")
+    if [ -f "$HOME/plugin" ]; then printf '[{"id":"cx@protoworks","version":"%s","enabled":true}]\n' "$(cat "$HOME/plugin")"; else echo '[]'; fi ;;
+  "plugin marketplace add protoworks-dev/claude-plugins") touch "$HOME/marketplace" ;;
+  "plugin marketplace update protoworks") : ;;
+  "plugin install cx@protoworks")
+    [ -f "$HOME/marketplace" ] || { echo "marketplace not found" >&2; exit 1; }
+    echo 0.1.0 > "$HOME/plugin" ;;
+  "plugin update cx@protoworks") echo 0.2.0 > "$HOME/plugin" ;;
+  "plugin uninstall cx@protoworks") rm "$HOME/plugin" ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#;
+    let path = world.home.join("fake-claude");
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let said = |ran: &Ran| format!("{}{}", ran.out, ran.err);
+
+    let before = world.ok(&["plugin", "status"]);
+    assert!(said(&before).contains("not installed"), "{}", said(&before));
+
+    // Typed inside a `cx run` session, it still goes to the default home.
+    let first = world.cx_with(&["plugin"], &[("CLAUDE_CONFIG_DIR", "/some/profile")]);
+    assert_eq!(first.code, 0, "{}", said(&first));
+    assert!(
+        said(&first).contains("added the Protoworks marketplace"),
+        "{}",
+        said(&first)
+    );
+    assert!(
+        said(&first).contains("installed cx@protoworks 0.1.0"),
+        "{}",
+        said(&first)
+    );
+
+    let again = world.ok(&["plugin", "install"]);
+    assert!(
+        said(&again).contains("refreshed the Protoworks marketplace"),
+        "{}",
+        said(&again)
+    );
+    assert!(
+        said(&again).contains("updated cx@protoworks from 0.1.0 to 0.2.0"),
+        "{}",
+        said(&again)
+    );
+    let status = world.ok(&["plugin", "status"]);
+    assert!(said(&status).contains("installed (0.2.0)"), "{}", said(&status));
+
+    let removed = world.ok(&["plugin", "remove"]);
+    assert!(said(&removed).contains("was removed"), "{}", said(&removed));
+    let twice = world.ok(&["plugin", "remove"]);
+    assert!(said(&twice).contains("not installed"), "{}", said(&twice));
+
+    let calls = std::fs::read_to_string(world.home.join("claude-calls")).unwrap();
+    assert!(!calls.contains("config dir leaked"), "{calls}");
+    assert!(!calls.contains("unexpected"), "{calls}");
+}

@@ -14,7 +14,7 @@
 //! | Module | What it holds |
 //! |---|---|
 //! | [`store`] | Accounts, settings and the last usage readings, in `state.json` |
-//! | [`secrets`] | Logins and keys, in the macOS Keychain or owner-only files |
+//! | [`secrets`] | Logins and keys: the macOS Keychain, or age-encrypted files, or fnox |
 //! | [`cred`] | The shape of a Claude Code login |
 //! | [`claude`] | Claude Code's own files, Keychain items and locks |
 //! | [`api`] | The three Anthropic endpoints cx calls |
@@ -24,6 +24,7 @@
 //! | [`activity`] | What each account was used for, from Claude Code's transcripts |
 //! | [`report`] | Everything cx knows as JSON, for the Claude Code plugin |
 //! | [`hook`] | What Claude Code's hooks tell cx during a session |
+//! | [`plugin`] | Installing the cx plugin for Claude Code |
 //! | [`run`] | Starting Claude Code on one account in one terminal |
 //! | [`accounts`] | Adding accounts: sign-in, API keys, import from claude-swap |
 //! | [`transfer`] | Encrypted export and import |
@@ -53,6 +54,7 @@ pub mod lock;
 #[cfg(target_os = "macos")]
 pub mod menubar;
 pub mod notify;
+pub mod plugin;
 pub mod rank;
 pub mod report;
 pub mod run;

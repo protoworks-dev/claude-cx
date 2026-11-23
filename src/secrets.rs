@@ -1,17 +1,32 @@
-//! Secret storage: the macOS Keychain through `/usr/bin/security`, or
-//! owner-only files when `CX_SECRETS=file` or the platform has no Keychain.
-//! A value never goes on a command line: one too long for `security`'s
-//! stdin is kept in an owner-only file instead.
+//! Secret storage. Where cx keeps each account's login or key:
+//!
+//! - the macOS Keychain, through `/usr/bin/security`;
+//! - on a system without a Keychain, [age](https://age-encryption.org)
+//!   files, one per secret, encrypted to a key file (see [`age_key_file`]);
+//! - `CX_SECRETS=fnox`: [fnox](https://fnox.jdx.dev), with any provider fnox
+//!   has;
+//! - `CX_SECRETS=file`: owner-only files that are not encrypted.
+//!
+//! A value never goes on a command line. One too long for `security`'s
+//! stdin is kept in an owner-only file instead, and fnox is handed a value
+//! on its stdin.
 //!
 //! The Keychain is driven through Apple's `security` tool and not through
 //! Security.framework. An item's access list names the program that created
 //! it, and `security` is the same binary on every run, so reads stay silent
 //! after cx is rebuilt. Claude Code reads and writes its own items the same
 //! way, which is why cx can read them without a prompt.
+//!
+//! This covers cx's own copies only. Claude Code keeps the login it is using
+//! in its own place: the Keychain on macOS, and a plain `.credentials.json`
+//! in its config home everywhere else. cx cannot change that.
 
+use crate::lock::DirLock;
 use crate::util::{self, run_bounded};
-use anyhow::{Context, Result, bail};
-use std::path::PathBuf;
+use age::secrecy::ExposeSecret;
+use anyhow::{Context, Result, anyhow, bail};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -26,20 +41,29 @@ const STDIN_LINE_LIMIT: usize = 4096 - 64;
 pub enum Backend {
     /// The user's macOS login Keychain, through `/usr/bin/security`.
     Keychain,
+    /// One age file per secret, `secrets/<name>.age` in the cx state
+    /// directory, encrypted to the key file [`age_key_file`] names.
+    Age,
+    /// The `fnox` command, with the config file [`fnox_config`] names.
+    Fnox,
     /// One file per secret under `secrets/` in the cx state directory,
     /// readable by the owner only (mode 0600) and not encrypted.
     File,
 }
 
-/// The backend in use: [`Backend::File`] when `CX_SECRETS=file` or the
-/// platform is not macOS, otherwise [`Backend::Keychain`]. The environment
-/// is read on every call.
+/// The backend in use. `CX_SECRETS` chooses one: `file`, `age` or `fnox`.
+/// Without it, [`Backend::Keychain`] on macOS and [`Backend::Age`] on every
+/// other platform. The environment is read on every call.
+///
+/// Any backend other than the Keychain also keeps cx away from Claude
+/// Code's own Keychain items, which is what the tests rely on.
 pub fn backend() -> Backend {
-    let forced = std::env::var("CX_SECRETS").unwrap_or_default();
-    if forced == "file" || !cfg!(target_os = "macos") {
-        Backend::File
-    } else {
-        Backend::Keychain
+    match std::env::var("CX_SECRETS").unwrap_or_default().as_str() {
+        "file" => Backend::File,
+        "age" => Backend::Age,
+        "fnox" => Backend::Fnox,
+        _ if cfg!(target_os = "macos") => Backend::Keychain,
+        _ => Backend::Age,
     }
 }
 
@@ -189,8 +213,16 @@ pub fn keychain_delete(service: &str, account: &str) -> Result<()> {
 /// cx's own secrets, one per account, keyed by a short name such as `acct-3`.
 pub const SERVICE: &str = "cx-accounts";
 
+fn secrets_dir() -> PathBuf {
+    util::store_root().join("secrets")
+}
+
 fn secret_file(name: &str) -> PathBuf {
-    util::store_root().join("secrets").join(format!("{name}.secret"))
+    secrets_dir().join(format!("{name}.secret"))
+}
+
+fn age_file(name: &str) -> PathBuf {
+    secrets_dir().join(format!("{name}.age"))
 }
 
 fn read_file(name: &str) -> Result<Option<String>> {
@@ -207,26 +239,379 @@ fn write_file(name: &str, value: &str) -> Result<()> {
     util::atomic_write(&path, value.as_bytes(), 0o600)
 }
 
-fn delete_file(name: &str) -> Result<()> {
-    match std::fs::remove_file(secret_file(name)) {
+fn remove(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).context("delete secret file"),
+        Err(e) => Err(e).with_context(|| format!("delete {}", path.display())),
     }
 }
 
-/// Read one of cx's own secrets: the Keychain item under [`SERVICE`], or
-/// the owner-only file `secrets/<name>.secret`. With the Keychain backend
-/// the file is looked at when there is no item, because a value too long
-/// for the Keychain write is kept there (see [`set`]). `Ok(None)` when it
-/// was never stored. The returned value is secret and must not be logged.
-pub fn get(name: &str) -> Result<Option<String>> {
-    match backend() {
-        Backend::Keychain => match keychain_get(SERVICE, name)? {
-            Some(text) => Ok(Some(text)),
-            None => read_file(name),
-        },
+fn delete_file(name: &str) -> Result<()> {
+    remove(&secret_file(name))
+}
+
+/// Serializes writes to the age and fnox stores across cx processes. It is
+/// taken last and nothing else is taken under it.
+fn write_lock() -> Result<DirLock> {
+    DirLock::acquire(
+        &util::store_root().join("secrets.lock"),
+        Duration::from_secs(30),
+        Duration::from_secs(20),
+    )
+    .context("another cx is writing a secret")
+}
+
+// ---- age ---------------------------------------------------------------
+
+/// Where an age key came from, for [`age_key_file`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum KeySource {
+    /// Named by this environment variable.
+    Env(&'static str),
+    /// A key file another tool keeps (fnox, mise or sops), found in place.
+    Shared,
+    /// cx's own key, `age.key` in the cx state directory. cx creates it.
+    Own,
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// The age key file cx encrypts its secrets to and opens them with, and
+/// where that choice came from. In order:
+///
+/// 1. `CX_AGE_KEY_FILE`;
+/// 2. the file fnox, sops or mise is told to use: `FNOX_AGE_KEY_FILE`,
+///    `SOPS_AGE_KEY_FILE`, `MISE_SOPS_AGE_KEY_FILE`;
+/// 3. a key file one of them keeps, when it exists: `~/.config/fnox/age.txt`,
+///    `~/.config/mise/age.txt`, `~/.config/sops/age/keys.txt`;
+/// 4. cx's own, `age.key` in the cx state directory.
+///
+/// Only computes the path. cx creates the file only for cases 1 and 4.
+pub fn age_key_file() -> (PathBuf, KeySource) {
+    for name in [
+        "CX_AGE_KEY_FILE",
+        "FNOX_AGE_KEY_FILE",
+        "SOPS_AGE_KEY_FILE",
+        "MISE_SOPS_AGE_KEY_FILE",
+    ] {
+        if let Some(path) = env_path(name) {
+            return (path, KeySource::Env(name));
+        }
+    }
+    let config = util::home().join(".config");
+    for path in [
+        config.join("fnox").join("age.txt"),
+        config.join("mise").join("age.txt"),
+        config.join("sops").join("age").join("keys.txt"),
+    ] {
+        if path.is_file() {
+            return (path, KeySource::Shared);
+        }
+    }
+    (util::store_root().join("age.key"), KeySource::Own)
+}
+
+/// The X25519 identities in an age key file: every line that starts with
+/// `AGE-SECRET-KEY-`. `Ok(None)` when there is no such file. Fails when
+/// the file holds no usable key.
+fn read_identities(path: &Path) -> Result<Option<Vec<age::x25519::Identity>>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read the age key file {}", path.display())),
+    };
+    let identities: Vec<age::x25519::Identity> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("AGE-SECRET-KEY-"))
+        .filter_map(|line| line.parse().ok())
+        .collect();
+    if identities.is_empty() {
+        bail!(
+            "the age key file {} holds no X25519 key (a line starting AGE-SECRET-KEY-)",
+            path.display()
+        );
+    }
+    Ok(Some(identities))
+}
+
+/// Create a new key file at `path` unless one is there, and return the keys
+/// in it. Two processes may race: the file is linked into place, which
+/// fails when it exists, and the loser reads the winner's key.
+fn create_key(path: &Path) -> Result<Vec<age::x25519::Identity>> {
+    let dir = path.parent().context("the age key path has no parent")?;
+    if dir == util::store_root() {
+        util::mkdir_private(dir)?;
+    } else {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    let identity = age::x25519::Identity::generate();
+    let text = format!(
+        "# Created by cx (claude-cx). It opens the logins under {}.\n# public key: {}\n{}\n",
+        secrets_dir().display(),
+        identity.to_public(),
+        identity.to_string().expose_secret()
+    );
+    let tmp = dir.join(format!(".age-key.cx-{}-{}", std::process::id(), fastrand::u32(..)));
+    util::atomic_write(&tmp, text.as_bytes(), 0o600)?;
+    let linked = std::fs::hard_link(&tmp, path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e).with_context(|| format!("create the age key file {}", path.display())),
+    }
+    read_identities(path)?.with_context(|| format!("the age key file {} vanished", path.display()))
+}
+
+/// The keys to use, for reading (`create` false) or writing. A missing key
+/// file is created only when it is cx's to create.
+fn identities(create: bool) -> Result<Vec<age::x25519::Identity>> {
+    let (path, source) = age_key_file();
+    if let Some(found) = read_identities(&path)? {
+        return Ok(found);
+    }
+    let creatable = matches!(source, KeySource::Own | KeySource::Env("CX_AGE_KEY_FILE"));
+    if create && creatable {
+        return create_key(&path);
+    }
+    match source {
+        KeySource::Env(name) if !creatable => bail!("{name} names {}, which does not exist", path.display()),
+        _ => bail!(
+            "the age key file {} is missing, so the stored logins cannot be opened. Restore it, or sign in again with `cx login`.",
+            path.display()
+        ),
+    }
+}
+
+/// Encrypt `plain` to the public halves of `identities`, with ASCII armour,
+/// so that `age -d -i <key file>` opens the result without cx.
+fn seal(identities: &[age::x25519::Identity], plain: &str) -> Result<Vec<u8>> {
+    let recipients: Vec<age::x25519::Recipient> = identities.iter().map(|i| i.to_public()).collect();
+    let encryptor = age::Encryptor::with_recipients(recipients.iter().map(|r| r as &dyn age::Recipient))
+        .map_err(|e| anyhow!("age could not encrypt: {e}"))?;
+    let mut out = Vec::new();
+    let armor = age::armor::ArmoredWriter::wrap_output(&mut out, age::armor::Format::AsciiArmor)?;
+    let mut writer = encryptor.wrap_output(armor)?;
+    writer.write_all(plain.as_bytes())?;
+    writer.finish()?.finish()?;
+    Ok(out)
+}
+
+/// Decrypt an age file, armoured or not, with any of `identities`.
+fn open(identities: &[age::x25519::Identity], sealed: &[u8]) -> Result<String> {
+    let decryptor = age::Decryptor::new(age::armor::ArmoredReader::new(sealed)).context("not an age file")?;
+    let mut reader = decryptor
+        .decrypt(identities.iter().map(|i| i as &dyn age::Identity))
+        .map_err(|e| match e {
+            age::DecryptError::NoMatchingKeys => anyhow!("it was encrypted to another key"),
+            other => anyhow!("{other}"),
+        })?;
+    let mut plain = String::new();
+    reader.read_to_string(&mut plain)?;
+    Ok(plain)
+}
+
+fn read_age(name: &str) -> Result<Option<String>> {
+    let path = age_file(name);
+    let sealed = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let plain = open(&identities(false)?, &sealed).with_context(|| {
+        format!(
+            "{} could not be opened with the key in {}",
+            path.display(),
+            age_key_file().0.display()
+        )
+    })?;
+    Ok(Some(plain))
+}
+
+fn write_age(name: &str, value: &str) -> Result<()> {
+    let sealed = seal(&identities(true)?, value)?;
+    let path = age_file(name);
+    util::mkdir_private(path.parent().context("secret path has no parent")?)?;
+    util::atomic_write(&path, &sealed, 0o600)
+}
+
+// ---- fnox --------------------------------------------------------------
+
+const FNOX_TIMEOUT: Duration = Duration::from_secs(20);
+/// What fnox prints, with exit 1, for a secret that is not defined.
+const FNOX_NOT_FOUND: &str = "secret::not_found";
+
+/// The fnox config file cx's secrets are kept in: `CX_FNOX_CONFIG`, else
+/// `fnox.toml` in the cx state directory. cx writes that file the first
+/// time it stores a secret, with one age provider on [`age_key_file`]. A
+/// file that is already there is used as it is, so it may name any provider
+/// fnox has; `CX_FNOX_PROVIDER` picks one that is not its default.
+pub fn fnox_config() -> PathBuf {
+    env_path("CX_FNOX_CONFIG").unwrap_or_else(|| util::store_root().join("fnox.toml"))
+}
+
+/// The name a cx secret has in fnox: `acct-3.prev` is `CX_ACCT_3_PREV`.
+/// fnox names secrets after environment variables.
+fn fnox_key(name: &str) -> String {
+    let body: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("CX_{body}")
+}
+
+fn fnox(config: &Path) -> Command {
+    let bin = std::env::var("CX_FNOX_BIN")
+        .ok()
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| "fnox".into());
+    let mut command = Command::new(bin);
+    // cx cannot answer a prompt, so fnox must not wait for one.
+    command.arg("-c").arg(config).args(["--non-interactive", "--no-color"]);
+    command
+}
+
+fn fnox_failure(what: &str, out: &util::Output) -> anyhow::Error {
+    let reason = out
+        .stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("no message");
+    anyhow!("fnox could not {what} (exit {}): {reason}", out.code)
+}
+
+fn fnox_run(command: &mut Command, stdin: Option<&str>) -> Result<util::Output> {
+    run_bounded(command, stdin, FNOX_TIMEOUT)
+        .context("`fnox` could not be run. Install fnox, set CX_FNOX_BIN, or choose another store with CX_SECRETS")
+}
+
+fn toml_string(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Write cx's own fnox config when there is none: one age provider on the
+/// key [`age_key_file`] names.
+fn fnox_ensure_config(config: &Path) -> Result<()> {
+    if config.exists() {
+        return Ok(());
+    }
+    let keys = identities(true)?;
+    let recipients: Vec<String> = keys.iter().map(|k| toml_string(&k.to_public().to_string())).collect();
+    let text = format!(
+        "# Written by cx (claude-cx). Each login is a secret named CX_ACCT_<number>.\n\
+         # Any fnox provider can take the place of this one: https://fnox.jdx.dev\n\
+         default_provider = \"cx\"\n\n\
+         [providers.cx]\n\
+         type = \"age\"\n\
+         recipients = [{}]\n\
+         key_file = {}\n",
+        recipients.join(", "),
+        toml_string(&age_key_file().0.to_string_lossy())
+    );
+    util::atomic_write(config, text.as_bytes(), 0o600)
+}
+
+fn fnox_get(name: &str) -> Result<Option<String>> {
+    let config = fnox_config();
+    if !config.exists() {
+        return Ok(None);
+    }
+    let out = fnox_run(fnox(&config).args(["get", fnox_key(name).as_str()]), None)?;
+    if out.code == 0 {
+        return Ok(Some(out.stdout.strip_suffix('\n').unwrap_or(&out.stdout).to_string()));
+    }
+    if out.stderr.contains(FNOX_NOT_FOUND) {
+        return Ok(None);
+    }
+    Err(fnox_failure("read a secret", &out))
+}
+
+fn fnox_set(name: &str, value: &str) -> Result<()> {
+    let config = fnox_config();
+    fnox_ensure_config(&config)?;
+    let mut command = fnox(&config);
+    command.args(["set", fnox_key(name).as_str()]);
+    if let Some(provider) = std::env::var("CX_FNOX_PROVIDER").ok().filter(|p| !p.is_empty()) {
+        command.args(["-p", provider.as_str()]);
+    }
+    // The value goes on stdin. fnox drops one final newline, so none is sent.
+    let out = fnox_run(&mut command, Some(value))?;
+    if out.code != 0 {
+        return Err(fnox_failure("store a secret", &out));
+    }
+    Ok(())
+}
+
+fn fnox_delete(name: &str) -> Result<()> {
+    let config = fnox_config();
+    if !config.exists() {
+        return Ok(());
+    }
+    let out = fnox_run(fnox(&config).args(["remove", fnox_key(name).as_str()]), None)?;
+    if out.code == 0 || out.stderr.contains(FNOX_NOT_FOUND) {
+        return Ok(());
+    }
+    Err(fnox_failure("remove a secret", &out))
+}
+
+// ---- cx's own secrets --------------------------------------------------
+
+/// The copy in the backend's own place, without looking anywhere older.
+fn get_primary(backend: Backend, name: &str) -> Result<Option<String>> {
+    match backend {
+        Backend::Keychain => keychain_get(SERVICE, name),
+        Backend::Age => read_age(name),
+        Backend::Fnox => fnox_get(name),
         Backend::File => read_file(name),
+    }
+}
+
+/// A copy left by an earlier backend: the age file when fnox is in use,
+/// then the plain file. Before 0.6 every system without a Keychain used
+/// plain files.
+fn get_older(backend: Backend, name: &str) -> Result<Option<String>> {
+    if backend == Backend::Fnox
+        && let Some(text) = read_age(name)?
+    {
+        return Ok(Some(text));
+    }
+    match backend {
+        Backend::File => Ok(None),
+        _ => read_file(name),
+    }
+}
+
+/// Read one of cx's own secrets from the backend in use. `Ok(None)` when it
+/// was never stored. The returned value is secret and must not be logged.
+///
+/// When the backend has no copy, older places are looked at: the plain file
+/// `secrets/<name>.secret` (with the Keychain, a value too long for the
+/// Keychain write is kept there, see [`set`]; elsewhere it is what cx wrote
+/// before it encrypted), and with fnox also the age file.
+pub fn get(name: &str) -> Result<Option<String>> {
+    let backend = backend();
+    if let Some(text) = get_primary(backend, name)? {
+        return Ok(Some(text));
+    }
+    if let Some(text) = get_older(backend, name)? {
+        return Ok(Some(text));
+    }
+    // A writer stores the new copy and then removes the older one. A read
+    // that fell between the two saw neither, and finds the new copy now.
+    match backend {
+        Backend::Age | Backend::Fnox => get_primary(backend, name),
+        _ => Ok(None),
     }
 }
 
@@ -236,8 +621,9 @@ pub fn get(name: &str) -> Result<Option<String>> {
 /// With the Keychain backend a value that fits goes to the Keychain. One
 /// that is too long to pass safely (see [`keychain_set`]) goes to the
 /// owner-only file instead, and the Keychain item is removed so an older
-/// value cannot be read in its place. Files are written atomically with
-/// mode 0600 in a private directory.
+/// value cannot be read in its place. With age or fnox the value is
+/// encrypted first and any copy an earlier backend left is then removed.
+/// Files are written atomically with mode 0600 in a private directory.
 pub fn set(name: &str, value: &str) -> Result<()> {
     match backend() {
         Backend::Keychain => match keychain_set(SERVICE, name, value)? {
@@ -247,17 +633,100 @@ pub fn set(name: &str, value: &str) -> Result<()> {
                 keychain_delete(SERVICE, name)
             }
         },
+        Backend::Age => {
+            let _lock = write_lock()?;
+            write_age(name, value)?;
+            delete_file(name)
+        }
+        Backend::Fnox => {
+            let _lock = write_lock()?;
+            fnox_set(name, value)?;
+            remove(&age_file(name))?;
+            delete_file(name)
+        }
         Backend::File => write_file(name, value),
     }
 }
 
-/// Remove one of cx's own secrets from wherever it is kept. Succeeds when
-/// it was already gone.
+/// Remove one of cx's own secrets from wherever it is kept, older places
+/// included. Succeeds when it was already gone.
 pub fn delete(name: &str) -> Result<()> {
-    if backend() == Backend::Keychain {
-        keychain_delete(SERVICE, name)?;
+    match backend() {
+        Backend::Keychain => keychain_delete(SERVICE, name)?,
+        Backend::Age => {
+            let _lock = write_lock()?;
+            remove(&age_file(name))?;
+        }
+        Backend::Fnox => {
+            let _lock = write_lock()?;
+            fnox_delete(name)?;
+            remove(&age_file(name))?;
+        }
+        Backend::File => {}
     }
     delete_file(name)
+}
+
+/// Move what an earlier backend left into the one in use: with age, the
+/// plain files cx wrote before it encrypted; with fnox, those and the age
+/// files. Returns how many secrets were moved. Does nothing with the
+/// Keychain or plain files.
+///
+/// A secret the backend already holds is newer than the leftover, so the
+/// leftover is only removed. Each secret is moved under the lock every
+/// write takes, so a login being renewed at the same moment is not undone.
+pub fn encrypt_leftovers() -> Result<usize> {
+    let backend = backend();
+    let suffixes: &[&str] = match backend {
+        Backend::Age => &[".secret"],
+        Backend::Fnox => &[".age", ".secret"],
+        Backend::Keychain | Backend::File => return Ok(0),
+    };
+    let entries = match std::fs::read_dir(secrets_dir()) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e).context("list the secrets directory"),
+    };
+    let mut names = std::collections::BTreeSet::new();
+    for entry in entries.flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        if file.starts_with('.') {
+            continue;
+        }
+        if let Some(name) = suffixes.iter().find_map(|s| file.strip_suffix(*s)) {
+            names.insert(name.to_string());
+        }
+    }
+    let mut moved = 0;
+    for name in names {
+        let _lock = write_lock()?;
+        if get_primary(backend, &name)?.is_none() {
+            let Some(value) = get_older(backend, &name)? else {
+                continue;
+            };
+            match backend {
+                Backend::Age => write_age(&name, &value)?,
+                _ => fnox_set(&name, &value)?,
+            }
+            moved += 1;
+        }
+        if backend == Backend::Fnox {
+            remove(&age_file(&name))?;
+        }
+        delete_file(&name)?;
+    }
+    Ok(moved)
+}
+
+/// Where cx's secrets are on this machine, in words for a message: "the
+/// macOS Keychain (service 'cx-accounts')", or the directory or file.
+pub fn place() -> String {
+    match backend() {
+        Backend::Keychain => format!("the macOS Keychain (service '{SERVICE}')"),
+        Backend::Age => format!("age-encrypted files under {}", secrets_dir().display()),
+        Backend::Fnox => format!("fnox ({})", fnox_config().display()),
+        Backend::File => format!("unencrypted files under {}", secrets_dir().display()),
+    }
 }
 
 #[cfg(test)]
@@ -323,5 +792,74 @@ mod tests {
             1,
             "only its definition may appear here"
         );
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cx-secrets-{name}-{}-{}",
+            std::process::id(),
+            fastrand::u32(..)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_age_file_opens_with_its_key_and_no_other() {
+        let (mine, other) = (age::x25519::Identity::generate(), age::x25519::Identity::generate());
+        let login = r#"{"claudeAiOauth":{"accessToken":"at-secret","refreshToken":"rt-secret"}}"#;
+        let sealed = seal(std::slice::from_ref(&mine), login).unwrap();
+        assert!(sealed.starts_with(b"-----BEGIN AGE ENCRYPTED FILE-----"));
+        assert!(!String::from_utf8_lossy(&sealed).contains("secret"));
+        assert_eq!(open(std::slice::from_ref(&mine), &sealed).unwrap(), login);
+        // Any key in the file opens it, as with a key file that was added to.
+        assert_eq!(open(&[other, mine], &sealed).unwrap(), login);
+        let stranger = age::x25519::Identity::generate();
+        let refused = open(&[stranger], &sealed).unwrap_err().to_string();
+        assert_eq!(refused, "it was encrypted to another key");
+        assert!(open(&[age::x25519::Identity::generate()], b"plain text").is_err());
+    }
+
+    #[test]
+    fn a_key_file_is_created_once_and_read_the_way_age_keygen_writes_it() {
+        let dir = scratch("key");
+        let path = dir.join("age.key");
+        assert!(read_identities(&path).unwrap().is_none());
+        let first = create_key(&path).unwrap();
+        // A second creation, as from a racing process, keeps the first key.
+        let second = create_key(&path).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].to_public().to_string(), second[0].to_public().to_string());
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(
+            std::fs::read_dir(&dir).unwrap().count() == 1,
+            "no temporary file is left"
+        );
+
+        // age-keygen's layout: comments, then the key; a second key below.
+        let extra = age::x25519::Identity::generate();
+        let text = format!(
+            "# created: 2026-01-01T00:00:00Z\n# public key: {}\n{}\n\n  {}  \n",
+            first[0].to_public(),
+            first[0].to_string().expose_secret(),
+            extra.to_string().expose_secret()
+        );
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(read_identities(&path).unwrap().unwrap().len(), 2);
+        std::fs::write(&path, "# no key here\n").unwrap();
+        assert!(read_identities(&path).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fnox_names_are_environment_variable_names() {
+        assert_eq!(fnox_key("acct-3"), "CX_ACCT_3");
+        assert_eq!(fnox_key("acct-3.prev"), "CX_ACCT_3_PREV");
+        assert_eq!(
+            fnox_key("acct-12.reply-1700000000000"),
+            "CX_ACCT_12_REPLY_1700000000000"
+        );
+        assert_eq!(toml_string(r#"/a "b"\c"#), r#""/a \"b\"\\c""#);
     }
 }
