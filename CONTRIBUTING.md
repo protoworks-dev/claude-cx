@@ -29,9 +29,9 @@ CX_HOME=/tmp/cx-scratch CX_SECRETS=file cargo run
 ## Releasing
 
 1. Move the entries under `[Unreleased]` in `CHANGELOG.md` to a new `## [x.y.z] - YYYY-MM-DD` section, add its link at the foot of the file, and set the same version in `Cargo.toml` (`cargo check` updates `Cargo.lock`). The version follows Semantic Versioning: a `feat` raises the minor number, a `fix` the patch number, and a breaking change the major number (the minor number while the version starts with 0). Commit as `chore(release): x.y.z`.
-2. `scripts/dist.sh` builds the four release archives into `dist/` with their `SHA256SUMS`: macOS with cargo on a Mac, Linux in a Debian 11 container (Docker), where it also runs the tests.
-3. `gh release create vx.y.z dist/cx-vx.y.z-*.tar.gz dist/SHA256SUMS` on the release commit. `install.sh`, `cx upgrade` and `cargo binstall` fetch the archives by name.
-4. `cargo publish --locked`, or run the Release workflow for the tag.
+2. On that commit on `main`, run `scripts/release.sh`. It builds the four release archives with `scripts/dist.sh` (macOS with cargo on a Mac, Linux in a Debian 11 container, where the tests also run), creates the GitHub release `vx.y.z` with the archives, `SHA256SUMS` and the version's changelog section as its notes, and publishes the crate when cargo has a crates.io token. `--dry-run` builds and checks without creating anything.
+
+`install.sh`, `cx upgrade` and `cargo binstall` fetch the archives by name from the latest release, so never create a release by hand without them.
 
 ## Rules for changes
 
