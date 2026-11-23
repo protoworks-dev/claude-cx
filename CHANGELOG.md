@@ -4,6 +4,10 @@ All notable changes are recorded here. The format is based on [Keep a Changelog]
 
 ## [Unreleased]
 
+### Changed
+
+- `scripts/release.sh` does a whole release: the archives, the GitHub release with the changelog section as its notes, and the crate.
+
 ## [0.7.0] - 2026-11-23
 
 ### Added
