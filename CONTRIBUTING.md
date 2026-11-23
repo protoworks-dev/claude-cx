@@ -26,6 +26,10 @@ To try a build by hand without touching your real accounts:
 CX_HOME=/tmp/cx-scratch CX_SECRETS=file cargo run
 ```
 
+## Releasing
+
+`scripts/dist.sh` builds the four release archives into `dist/` with their `SHA256SUMS`: macOS with cargo on a Mac, Linux in a Debian 11 container (Docker), where it also runs the tests. Attach them to the GitHub release for the tag `v<version>`; `install.sh` and `cargo binstall` fetch them by name.
+
 ## Rules for changes
 
 - **Credentials.** Read the header of `src/engine.rs` before changing anything that reads or writes a login. Keep its lock order and its rule that a token reply is stored before anything else happens. A change there needs a test that fails without it.

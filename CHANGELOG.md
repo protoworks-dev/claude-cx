@@ -4,6 +4,12 @@ All notable changes are recorded here. The format follows [Keep a Changelog](htt
 
 ## Unreleased
 
+## 0.6.0 - 2026-11-23
+
+### Added
+
+- Prebuilt binaries for macOS and Linux, on Apple and Intel/AMD and ARM chips, on each GitHub release. `install.sh` fetches the right one and checks its SHA-256; `cargo binstall claude-cx` uses them too. Installing no longer needs a Rust toolchain. `scripts/dist.sh` builds them: macOS with cargo, Linux in a Debian 11 container, where the tests also run.
+
 ### Security
 
 - On a system without a Keychain (Linux), logins and API keys are now encrypted with age instead of being kept in plain files. The key is the one fnox, mise or sops already uses when there is one, else a key cx makes in `~/.cx/age.key`. Plain files left by 0.5 are encrypted the first time cx runs. `CX_SECRETS=file` keeps the old behaviour.
