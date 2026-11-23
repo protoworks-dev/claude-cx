@@ -7,6 +7,8 @@
 
 Several Claude accounts behind one Claude Code. The `cx` command keeps a login for each account, shows how much of each one's limits is used and what used it, and puts your work on the account with the most room.
 
+![The cx dashboard: four accounts with their limits, the selected account in detail, and which account is next](docs/screenshots/dashboard.svg)
+
 It is a Rust rewrite of the ideas in [claude-swap](https://github.com/realiti4/claude-swap), with its own sign-in, its own token renewal, a load balancer and a dashboard.
 
 > **Not an Anthropic product.** claude-cx is not affiliated with or endorsed by Anthropic. Whether you may hold and rotate several accounts is governed by Anthropic's terms for those accounts; read them before using this, because the accounts are yours to lose. The tool only ever talks to Anthropic's own endpoints with your own logins.
@@ -51,6 +53,7 @@ Without claude-swap: `cx add` takes over the login Claude Code is using now, and
 | `cx export backup.cx` | Every account, login and setting in one passphrase-encrypted file. `cx import` restores it |
 | `cx statusline` | One line for Claude Code's status bar |
 | `cx completions zsh` | Shell completion script |
+| `cx plugin` | Install the cx plugin for Claude Code, or update it |
 | `cx doctor` | Check the setup |
 
 An account is named by number, alias (`cx alias 3 work`), email, or any unambiguous part of one.
@@ -64,6 +67,16 @@ An account is named by number, alias (`cx alias 3 work`), email, or any unambigu
 - **Which account next.** The order cx would use the accounts in, once for Fable work and once for other models.
 - **API keys.** A table with an "add" row. A key is typed or pasted into a pop-up and never shown; storing one turns on its use when every subscription is at its limit.
 - **Settings** (`S`). A list; Enter opens an editor that fits the value: up and down for a number, a list for a choice, a checklist for the shared entries.
+
+| Waste and speed (`v`) | Settings (`S`) |
+|---|---|
+| ![The second page of cards: cache rebuilds, stops and corrections, hook time](docs/screenshots/waste.svg) | ![The settings list with an editor for each value](docs/screenshots/settings.svg) |
+
+The same numbers without the dashboard, for a script or a glance:
+
+![cx ls and cx why in a plain terminal](docs/screenshots/list.svg)
+
+The pictures show made-up accounts. `python3 scripts/screenshots.py` makes them again from the real program.
 
 The breakdown is read from Claude Code's own transcripts under `~/.claude/projects`, which name the account each session ran on. Use from another computer or from claude.ai counts against an account's limits but leaves no record here. Shares are weighted the way the API prices tokens; the subscription limits are not published, so they are a yardstick and not the server's count. cx only reads the transcripts and keeps sums, never message text, in `~/.cx/activity.json`.
 
@@ -122,6 +135,12 @@ It prints the session's account and its limits (`#2 work · 5h 41% · wk 63%`) f
 ## The Claude Code plugin
 
 The [cx plugin](https://github.com/protoworks-dev/claude-plugins) lets Claude Code read what cx measures and advise on its own setup: which cache rebuilds to stop, which settings to change, what should become a skill or a hook, and why you had to stop or correct it. Its hooks also tell cx about sessions as they run.
+
+```sh
+cx plugin
+```
+
+That one command adds the Protoworks marketplace to Claude Code and installs the plugin, or updates both when they are already there; `cx plugin status` and `cx plugin remove` do what they say. It runs Claude Code's own commands, which you can also type yourself:
 
 ```sh
 claude plugin marketplace add protoworks-dev/claude-plugins

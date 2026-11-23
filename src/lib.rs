@@ -24,6 +24,7 @@
 //! | [`activity`] | What each account was used for, from Claude Code's transcripts |
 //! | [`report`] | Everything cx knows as JSON, for the Claude Code plugin |
 //! | [`hook`] | What Claude Code's hooks tell cx during a session |
+//! | [`plugin`] | Installing the cx plugin for Claude Code |
 //! | [`run`] | Starting Claude Code on one account in one terminal |
 //! | [`accounts`] | Adding accounts: sign-in, API keys, import from claude-swap |
 //! | [`transfer`] | Encrypted export and import |
@@ -53,6 +54,7 @@ pub mod lock;
 #[cfg(target_os = "macos")]
 pub mod menubar;
 pub mod notify;
+pub mod plugin;
 pub mod rank;
 pub mod report;
 pub mod run;

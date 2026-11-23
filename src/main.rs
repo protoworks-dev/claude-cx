@@ -167,6 +167,11 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<ServiceCmd>,
     },
+    /// Install the cx plugin for Claude Code, or bring it up to date
+    Plugin {
+        #[command(subcommand)]
+        action: Option<PluginCmd>,
+    },
     /// Check the setup and report anything wrong
     Doctor,
     /// Print usage and waste as JSON, for the Claude Code plugin and other tools
@@ -189,6 +194,16 @@ enum Cmd {
     /// Print the usage endpoint's reply for an account, as the server sent it
     #[command(hide = true)]
     RawUsage { account: String },
+}
+
+#[derive(Subcommand)]
+enum PluginCmd {
+    /// Add the Protoworks marketplace and install the plugin, or update it (the default)
+    Install,
+    /// Say whether Claude Code has the plugin, and which version
+    Status,
+    /// Uninstall the plugin from Claude Code
+    Remove,
 }
 
 #[derive(Subcommand)]
@@ -453,6 +468,23 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Some(Cmd::Completions { shell }) => {
             clap_complete::generate(shell, &mut Cli::command(), "cx", &mut std::io::stdout());
         }
+        Some(Cmd::Plugin { action }) => match action.unwrap_or(PluginCmd::Install) {
+            PluginCmd::Install => {
+                ui::note("Asking Claude Code to install the plugin from github.com/protoworks-dev/claude-plugins…");
+                for line in claude_cx::plugin::install()? {
+                    ui::ok(&line);
+                }
+                ui::note("Claude Code sessions that are open now load it when they are restarted.");
+            }
+            PluginCmd::Status => ui::note(&plugin_status(&claude_cx::plugin::status()?)),
+            PluginCmd::Remove => {
+                if claude_cx::plugin::remove()? {
+                    ui::ok("the cx plugin was removed from Claude Code");
+                } else {
+                    ui::note("the cx plugin is not installed");
+                }
+            }
+        },
         Some(Cmd::Doctor) => return doctor(&engine),
         Some(Cmd::Hook) => {}
         Some(Cmd::Report { days, .. }) => {
@@ -800,6 +832,18 @@ fn statusline(engine: &Engine) -> Result<String> {
     Ok(parts.join(" · "))
 }
 
+fn plugin_status(status: &claude_cx::plugin::Status) -> String {
+    match (&status.version, status.enabled) {
+        (None, _) => "the cx plugin for Claude Code is not installed. `cx plugin` installs it.".to_string(),
+        (Some(version), true) => format!("the cx plugin for Claude Code is installed ({version})"),
+        (Some(version), false) => {
+            format!(
+                "the cx plugin for Claude Code is installed ({version}) but switched off. `cx plugin` switches it on."
+            )
+        }
+    }
+}
+
 fn doctor(engine: &Engine) -> Result<i32> {
     let mut problems = 0;
     let mut check = |good: bool, text: String| {
@@ -863,6 +907,10 @@ fn doctor(engine: &Engine) -> Result<i32> {
             "CX_SECRETS=file: the logins are readable by you only, but not encrypted".to_string(),
         ),
         secrets::Backend::Keychain => {}
+    }
+    // The plugin is optional, so its absence is said and not counted.
+    if let Ok(status) = claude_cx::plugin::status() {
+        println!("  {}", plugin_status(&status));
     }
     for name in claude::AUTH_OVERRIDE_ENV {
         if std::env::var_os(name).is_some() {

@@ -1200,3 +1200,72 @@ esac
     assert_ne!(absent.code, 0);
     assert!(absent.err.contains("fnox"), "{}", absent.err);
 }
+
+#[test]
+fn one_command_installs_the_plugin_through_claude_code() {
+    let world = World::new();
+    // A stand-in for `claude plugin`: it remembers what was added and
+    // installed, and notes every call.
+    let script = r#"#!/bin/sh
+echo "$*" >> "$HOME/claude-calls"
+[ -n "$CLAUDE_CONFIG_DIR" ] && echo "config dir leaked" >> "$HOME/claude-calls"
+case "$*" in
+  "plugin marketplace list --json")
+    if [ -f "$HOME/marketplace" ]; then echo '[{"name":"protoworks","source":"github","repo":"protoworks-dev/claude-plugins"}]'; else echo '[]'; fi ;;
+  "plugin list --json")
+    if [ -f "$HOME/plugin" ]; then printf '[{"id":"cx@protoworks","version":"%s","enabled":true}]\n' "$(cat "$HOME/plugin")"; else echo '[]'; fi ;;
+  "plugin marketplace add protoworks-dev/claude-plugins") touch "$HOME/marketplace" ;;
+  "plugin marketplace update protoworks") : ;;
+  "plugin install cx@protoworks")
+    [ -f "$HOME/marketplace" ] || { echo "marketplace not found" >&2; exit 1; }
+    echo 0.1.0 > "$HOME/plugin" ;;
+  "plugin update cx@protoworks") echo 0.2.0 > "$HOME/plugin" ;;
+  "plugin uninstall cx@protoworks") rm "$HOME/plugin" ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#;
+    let path = world.home.join("fake-claude");
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let said = |ran: &Ran| format!("{}{}", ran.out, ran.err);
+
+    let before = world.ok(&["plugin", "status"]);
+    assert!(said(&before).contains("not installed"), "{}", said(&before));
+
+    // Typed inside a `cx run` session, it still goes to the default home.
+    let first = world.cx_with(&["plugin"], &[("CLAUDE_CONFIG_DIR", "/some/profile")]);
+    assert_eq!(first.code, 0, "{}", said(&first));
+    assert!(
+        said(&first).contains("added the Protoworks marketplace"),
+        "{}",
+        said(&first)
+    );
+    assert!(
+        said(&first).contains("installed cx@protoworks 0.1.0"),
+        "{}",
+        said(&first)
+    );
+
+    let again = world.ok(&["plugin", "install"]);
+    assert!(
+        said(&again).contains("refreshed the Protoworks marketplace"),
+        "{}",
+        said(&again)
+    );
+    assert!(
+        said(&again).contains("updated cx@protoworks from 0.1.0 to 0.2.0"),
+        "{}",
+        said(&again)
+    );
+    let status = world.ok(&["plugin", "status"]);
+    assert!(said(&status).contains("installed (0.2.0)"), "{}", said(&status));
+
+    let removed = world.ok(&["plugin", "remove"]);
+    assert!(said(&removed).contains("was removed"), "{}", said(&removed));
+    let twice = world.ok(&["plugin", "remove"]);
+    assert!(said(&twice).contains("not installed"), "{}", said(&twice));
+
+    let calls = std::fs::read_to_string(world.home.join("claude-calls")).unwrap();
+    assert!(!calls.contains("config dir leaked"), "{calls}");
+    assert!(!calls.contains("unexpected"), "{calls}");
+}
