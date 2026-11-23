@@ -55,6 +55,7 @@ Without claude-swap: `cx add` takes over the login Claude Code is using now, and
 | `cx use` | Move the default login to the best account. `cx use 3` for a specific one |
 | `cx auto` | Watch usage and move the default login before it hits a limit |
 | `cx service install` | Run `cx auto` in the background, started at login (macOS) |
+| `cx status` | Which account Claude Code is on now, and which one cx would choose |
 | `cx why` | Show the ranking and what `cx auto` would do now, with reasons |
 | `cx login 3` | Sign in again to an account whose refresh token has died |
 | `cx map work` | Pin this directory to an account: a bare `cx run` here and below starts on it |
@@ -63,7 +64,10 @@ Without claude-swap: `cx add` takes over the login Claude Code is using now, and
 | `cx statusline` | One line for Claude Code's status bar |
 | `cx completions zsh` | Shell completion script |
 | `cx plugin` | Install the cx plugin for Claude Code, or update it |
+| `cx threshold work 80` | Give one account its own switch line |
+| `cx upgrade` | Replace cx with the latest release, checked against its SHA-256 |
 | `cx doctor` | Check the setup |
+| `cx help` | Every command, grouped by what it is for |
 
 An account is named by number, alias (`cx alias 3 work`), email, or any unambiguous part of one.
 

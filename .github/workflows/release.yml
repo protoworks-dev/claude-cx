@@ -1,13 +1,18 @@
 name: Release
 
-# Publishes to crates.io when a version tag is pushed. The tag must match
-# the version in Cargo.toml. Needs the CARGO_REGISTRY_TOKEN secret.
+# Publishes a released version to crates.io. Started by hand for a tag that
+# already has its GitHub release: the archives on that release are built with
+# scripts/dist.sh (macOS on a Mac, Linux in a container), which CI cannot do
+# on one runner. Needs the CARGO_REGISTRY_TOKEN secret. See CONTRIBUTING.md.
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The version tag to publish, such as v0.7.0
+        required: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   publish:
@@ -15,16 +20,16 @@ jobs:
     runs-on: ${{ vars.CI_RUNNER || 'skunkworks-ci' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Tag matches the crate version
+        env:
+          TAG: ${{ inputs.tag }}
         run: |
           version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
-          test "v$version" = "$GITHUB_REF_NAME"
+          test "v$version" = "$TAG"
       - run: cargo test --locked
       - run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      - name: GitHub release
-        run: gh release create "$GITHUB_REF_NAME" --generate-notes
-        env:
-          GH_TOKEN: ${{ github.token }}

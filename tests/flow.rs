@@ -1269,3 +1269,56 @@ esac
     assert!(!calls.contains("config dir leaked"), "{calls}");
     assert!(!calls.contains("unexpected"), "{calls}");
 }
+
+#[test]
+fn help_groups_the_commands_and_a_first_run_says_where_to_start() {
+    let world = World::new();
+    let first = world.ok(&[]);
+    assert!(
+        first.out.contains("cx has no accounts yet") && first.out.contains("cx login"),
+        "{}",
+        first.out
+    );
+    let help = world.ok(&["help"]).out;
+    for heading in [
+        "See what is going on:",
+        "Choose an account:",
+        "Tune how cx chooses:",
+        "Start here:",
+    ] {
+        assert!(help.contains(heading), "{help}");
+    }
+    assert_eq!(help, world.ok(&["--help"]).out);
+    // One command's own help is still clap's.
+    assert!(world.ok(&["help", "threshold"]).out.contains("Usage: cx threshold"));
+}
+
+#[test]
+fn status_names_the_default_login_and_an_own_switch_line_moves_an_account_down() {
+    let world = World::new();
+    for account in ["A", "B"] {
+        world.sign_in_claude(account, 1, now_ms() + 8 * HOUR_MS);
+        world.ok(&["add"]);
+        world.set_usage(account, 85.0, 10.0);
+    }
+    world.ok(&["ls", "--fresh"]);
+    let status = world.ok(&["status"]).out;
+    assert!(
+        status.contains("default login") && status.contains("choosing by"),
+        "{status}"
+    );
+    let json: Value = serde_json::from_str(&world.ok(&["status", "--json"]).out).unwrap();
+    assert_eq!(json["accounts"], 2);
+
+    let set = world.ok(&["threshold", "1", "80"]).out;
+    assert!(set.contains("80% used"), "{set}");
+    let why = world.ok(&["why"]).out;
+    assert!(why.contains("own switch line 80%"), "{why}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&world.ok(&["status", "--json"]).out).unwrap()["best"],
+        2
+    );
+    assert_ne!(world.cx(&["threshold", "1", "0"]).code, 0);
+    world.ok(&["threshold", "1"]);
+    assert!(!world.ok(&["why"]).out.contains("own switch line"));
+}

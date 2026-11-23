@@ -1,0 +1,4 @@
+#!/bin/sh
+# Refuse a commit whose subject is not a Conventional Commit.
+# Turn on with: git config core.hooksPath .githooks
+exec "$(git rev-parse --show-toplevel)/scripts/check-commits.sh" "$1"
