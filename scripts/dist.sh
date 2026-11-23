@@ -44,7 +44,7 @@ if [ "$what" = all ] || [ "$what" = linux ]; then
   command -v docker >/dev/null 2>&1 || { echo "dist: the Linux archives need Docker" >&2; exit 1; }
   # The container builds for its own chip natively and for the other one with Debian's cross
   # compiler (ring and the linker need a C toolchain for the target). The source is mounted
-  # read-only; only dist-linux/ comes back.
+  # read-only; only dist/linux/ comes back.
   mkdir -p dist/linux
   docker run --rm \
     -v "$PWD":/src:ro -v "$PWD/dist/linux":/out \
@@ -60,8 +60,9 @@ if [ "$what" = all ] || [ "$what" = linux ]; then
       esac
       echo "dist: $(rustc --version), glibc $(ldd --version | sed -n 1p | sed "s/.* //")"
       echo "dist: testing on $native"
-      cargo test --locked 2>&1 | grep -E "^test result|FAILED|panicked|^error" || true
-      cargo test --locked >/dev/null 2>&1 || { echo "dist: the tests fail on Linux" >&2; exit 1; }
+      # Warnings are errors here as in CI: code only Linux compiles is checked nowhere else.
+      RUSTFLAGS="-D warnings" cargo test --locked >/tmp/test.log 2>&1 || { tail -40 /tmp/test.log; echo "dist: the tests fail on Linux" >&2; exit 1; }
+      grep -E "^test result" /tmp/test.log
       cargo build --release --locked --target "$native"
       cp "/target/$native/release/cx" "/out/cx-$native"
       apt-get update -qq >/dev/null && apt-get install -y -qq "gcc-$(echo $gnu | tr _ -)" "libc6-dev-$deb-cross" >/dev/null

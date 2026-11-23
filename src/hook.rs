@@ -246,6 +246,7 @@ pub enum Awake {
 /// How long to hold the machine awake after a turn, in seconds. Claude
 /// Code summarises an idle conversation about an hour after its last
 /// request; this leaves it twenty minutes to finish.
+#[cfg(target_os = "macos")]
 const AWAKE_S: u32 = 80 * 60;
 
 /// The size from which Claude Code summarises an idle conversation: its
