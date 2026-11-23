@@ -1,6 +1,6 @@
 [package]
 name = "claude-cx"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Several Claude accounts behind one Claude Code: a dashboard that shows each account's limits and what used them, and switches to the one with the most room"
@@ -11,7 +11,14 @@ documentation = "https://docs.rs/claude-cx"
 readme = "README.md"
 keywords = ["claude", "claude-code", "accounts", "tui", "cli"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = [".github/", "tests/", "docs/", "scripts/"]
+exclude = [".github/", "tests/", "docs/", "scripts/", "install.sh", "dist/"]
+
+# Prebuilt binaries, on the GitHub release for each version (scripts/dist.sh makes them).
+# `cargo binstall claude-cx` fetches one instead of compiling.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/cx-v{ version }-{ target }.tar.gz"
+bin-dir = "cx-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
 
 [[bin]]
 name = "cx"

@@ -16,14 +16,23 @@ It is a Rust rewrite of the ideas in [claude-swap](https://github.com/realiti4/c
 ## Install
 
 ```bash
-cargo install --locked claude-cx
+curl -fsSL https://raw.githubusercontent.com/protoworks-dev/claude-cx/main/install.sh | sh
 ```
 
-This installs one command, `cx`. It needs [Claude Code](https://claude.com/claude-code) installed, and Rust 1.88 or newer and a C compiler to build. `--locked` builds with the dependency versions the release was tested with. To install the code as it is on `main`: `cargo install --locked --git https://github.com/protoworks-dev/claude-cx`.
+This puts one command, `cx`, in `~/.local/bin`. It downloads the prebuilt binary for your machine from the [latest release](https://github.com/protoworks-dev/claude-cx/releases/latest) and checks its SHA-256 first. There are binaries for macOS (Apple silicon and Intel) and Linux (x86-64 and ARM64, glibc 2.31 or newer). `CX_INSTALL_DIR` chooses another directory and `CX_VERSION` another version. cx needs [Claude Code](https://claude.com/claude-code) installed.
+
+With a Rust toolchain, either of these does the same:
+
+```bash
+cargo binstall claude-cx            # the same prebuilt binary, through cargo-binstall
+cargo install --locked claude-cx    # build it: Rust 1.88 or newer and a C compiler
+```
+
+`--locked` builds with the dependency versions the release was tested with. To build the code as it is on `main`: `cargo install --locked --git https://github.com/protoworks-dev/claude-cx`.
 
 macOS is the main platform: logins live in the Keychain. On Linux, which has no Keychain, cx encrypts them with [age](https://age-encryption.org) (see [Where logins are kept](#where-logins-are-kept)); the menu-bar item and the background service are macOS only.
 
-If `cargo` itself fails before anything compiles, the cause is the toolchain setup and not cx: `rustc -vV` must work in the directory you install from. Two cases seen: a version manager's `cargo` shim with no version chosen for that directory (use rustup's `~/.cargo/bin/cargo`), and a `RUSTC_WRAPPER` such as sccache whose server is not answering (`RUSTC_WRAPPER= cargo install --locked claude-cx` builds without it).
+If `cargo install` fails before anything compiles, the cause is the toolchain setup and not cx: `rustc -vV` must work in the directory you install from. Two cases seen: a version manager's `cargo` shim with no version chosen for that directory (use rustup's `~/.cargo/bin/cargo`), and a `RUSTC_WRAPPER` such as sccache whose server is not answering (`RUSTC_WRAPPER= cargo install --locked claude-cx` builds without it).
 
 ## Start
 
