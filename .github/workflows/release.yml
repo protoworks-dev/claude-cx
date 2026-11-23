@@ -19,7 +19,7 @@ jobs:
     # See ci.yml for CI_RUNNER.
     runs-on: ${{ vars.CI_RUNNER || 'skunkworks-ci' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
